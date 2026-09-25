@@ -1,0 +1,11 @@
+# Python 3.13 (tested on 3.13.7, Windows 11, CPU only, 16 GB RAM)
+numpy==2.5.3
+pandas==3.0.6
+pyarrow==25.0.1
+scipy==1.18.1
+scikit-learn==1.9.1
+lightgbm==4.7.0
+rapidfuzz==3.14.6
+Unidecode==1.4.0
+sparse_dot_topn==1.2.0
+psutil==7.2.2
