@@ -1,8 +1,7 @@
 """Candidate generation at scale: sparse token retrieval + a learned stage-1 re-ranker.
 
 Every record becomes a bag of namespaced tokens:
-    n|<name token>   c|<compact name>   p|<consonant skeleton of a name token>
-    k|<consonant skeleton of the whole compact name>   a|<address token>
+    n|<name token>   c|<compact name>   p|<consonant skeleton of a name token>   a|<address token>
 Skeleton tokens ("builders" and the romanised Tamil "piltrs" both -> "pltrs"; "vidyaalya" and
 "vidyalaya" -> "ptl") let transliterated and vowel-typo names meet. Tokens seen once are dropped;
 tokens with document frequency above `max_df` get zero *retrieval* weight.
@@ -86,17 +85,8 @@ def record_tokens(df: pd.DataFrame):
     for core, addr in zip(df["name_core"], df["addr_clean"]):
         words = core.split()
         toks = ["n|" + t for t in words]
-        compact = "".join(words)
-        if compact:
-            # emitted even for one-word names, so a domain-style target ("glistensons.com")
-            # can meet the compact form of a multi-word S1 name ("Glisten & Sons")
-            toks.append("c|" + compact)
-            # skeleton of the whole compact name: "sevnkeyr" (romanised Devanagari) and
-            # "sevencare" both -> "spnkr". Unlike the per-token skeletons it is long and rare,
-            # so it carries a high IDF and can pull native-script names into the pool.
-            ksk = skeleton(compact)
-            if len(ksk) >= 4:
-                toks.append("k|" + ksk)
+        if len(words) > 1:
+            toks.append("c|" + "".join(words))
         for t in words:
             if len(t) >= 3 and not t.isdigit():
                 sk = skeleton(t)
@@ -131,7 +121,7 @@ class TokenIndex:
         idf = np.log(X.shape[0] / np.maximum(dfreq, 1)).astype(np.float32)
         self.n1, self.X = len(s1), X
         # per-kind weight vectors for overlap features: shared = (X[a] * X[b]) @ w
-        self.w = {"name": idf * (ns == "n"), "skel": idf * (ns == "p"), "cskel": idf * (ns == "k"),
+        self.w = {"name": idf * (ns == "n"), "skel": idf * (ns == "p"),
                   "addr": idf * ((ns == "a") & ~is_num), "num": is_num.astype(np.float32)}
         self.mass = {k: X @ v for k, v in self.w.items()}
 

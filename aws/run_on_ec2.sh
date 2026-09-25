@@ -2,6 +2,8 @@
 # Run on the EC2 instance (Ubuntu 24.04) from ~/Amazon_ml after unpacking upload.tgz:
 #     bash aws/run_on_ec2.sh            # full: train on all training data, predict test, validate
 #     bash aws/run_on_ec2.sh predict    # only predict with an existing trained model
+#     bash aws/run_on_ec2.sh bench      # train OLD code (aws/baseline_src) and NEW code on the same
+#                                       # sample, paired-bootstrap the difference, then predict
 # Everything is logged to ~/Amazon_ml/run.log. Safe to run inside tmux (recommended).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -31,7 +33,20 @@ export PYTHONUNBUFFERED=1
 echo "vCPUs: $(nproc), RAM: $(free -g | awk '/Mem:/{print $2}') GB" | tee -a "$LOG"
 
 cd code/business_entity_resolution
-if [ "$MODE" = "all" ]; then
+if [ "$MODE" = "bench" ]; then
+    # Old code (git HEAD, aws/baseline_src, reporting-only patch) vs new code on the SAME seeded
+    # 400k-entity sample, then a paired bootstrap of per-entity OOF F0.5 (see pipeline --baseline).
+    BASE_ART="$ROOT/aws/baseline_artifacts"
+    if [ ! -f "$BASE_ART/oof_entity_f05.parquet" ]; then
+        echo "==== BASELINE (old code) ====" | tee -a "$LOG"
+        "$PY" "$ROOT/aws/baseline_src/pipeline.py" train --sample 400000 --min-free-gb 0 \
+            --data-dir "$ROOT/student_resource/dataset" --cache-dir "$ROOT/code/business_entity_resolution/cache" \
+            --artifact-dir "$BASE_ART" --output-dir "$ROOT/aws/baseline_output" 2>&1 | tee -a "$LOG"
+    fi
+    echo "==== NEW CODE ====" | tee -a "$LOG"
+    "$PY" src/pipeline.py train --sample 400000 --dump-errors --min-free-gb 0 \
+        --baseline "$BASE_ART" 2>&1 | tee -a "$LOG"
+elif [ "$MODE" = "all" ]; then
     # Full training data: stage-2 sample of 400k S1 (the laptop default is 200k).
     "$PY" src/pipeline.py train --sample 400000 --dump-errors --min-free-gb 0 2>&1 | tee -a "$LOG"
 fi
@@ -42,5 +57,5 @@ cd "$ROOT/student_resource"
 "$PY" utils/validate_submission.py \
     --matching ../output/matching_results.tsv \
     --candidate ../output/candidate_pairs.tsv \
-    --test-dir dataset/test 2>&1 | tee -a "$LOG"
+    --test-dir dataset/test --check-ids 2>&1 | tee -a "$LOG"
 echo "DONE. Outputs in $ROOT/output/" | tee -a "$LOG"

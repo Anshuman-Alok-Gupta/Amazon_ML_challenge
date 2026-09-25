@@ -13,8 +13,6 @@ from rapidfuzz.distance import JaroWinkler
 from rapidfuzz.process import cpdist
 from scipy import sparse
 
-from blocking import skeleton
-
 SCORERS = {
     "ratio": fuzz.ratio,
     "partial": fuzz.partial_ratio,
@@ -26,14 +24,6 @@ SCORERS = {
 
 def _cp(a, b, scorer) -> np.ndarray:
     return cpdist(a, b, scorer=scorer, workers=-1, dtype=np.float32)
-
-
-def _skeletons(names: pd.Series) -> list[str]:
-    """Consonant skeleton of each name, computed once per distinct value."""
-    names = names.astype(str)
-    uniq = pd.unique(names)
-    lut = dict(zip(uniq, (skeleton(u) for u in uniq)))
-    return names.map(lut).tolist()
 
 
 def _overlap(idx, l1, lt, F, chunk: int = 1_000_000):
@@ -61,11 +51,10 @@ def _overlap(idx, l1, lt, F, chunk: int = 1_000_000):
         F[f"{k}_idf_cov_s1"] = np.where(ma > 0, sh / np.maximum(ma, 1e-6), np.nan)
         F[f"{k}_idf_cov_t"] = np.where(mb > 0, sh / np.maximum(mb, 1e-6), np.nan)
         F[f"{k}_idf_max_shared"] = mx[k]
-    for k in ("skel", "cskel"):
-        sh, ma, mb = shared[k], idx.mass[k][l1], idx.mass[k][lt_g]
-        union = ma + mb - sh
-        F[f"{k}_idf_jac"] = np.where(union > 0, sh / np.maximum(union, 1e-6), np.nan)
-        F[f"{k}_idf_cov_t"] = np.where(mb > 0, sh / np.maximum(mb, 1e-6), np.nan)
+    sh, ma, mb = shared["skel"], idx.mass["skel"][l1], idx.mass["skel"][lt_g]
+    union = ma + mb - sh
+    F["skel_idf_jac"] = np.where(union > 0, sh / np.maximum(union, 1e-6), np.nan)
+    F["skel_idf_cov_t"] = np.where(mb > 0, sh / np.maximum(mb, 1e-6), np.nan)
     sh, na, nb = shared["num"], idx.mass["num"][l1], idx.mass["num"][lt_g]
     both = (na > 0) & (nb > 0)
     F["num_shared"] = sh
@@ -111,23 +100,6 @@ def build_features(pairs: pd.DataFrame, s1: pd.DataFrame, tgt: pd.DataFrame, idx
     first_b = B["name_core"].str.split(" ", n=1).str[0].values
     F["first_tok_equal"] = (first_a == first_b).astype(np.float32)
     F["name_nonlatin_t"] = B["name_nonlatin"].values.astype(np.float32)
-
-    # transliteration-robust: similarity of the consonant skeletons of the whole compact names
-    # (computed once per distinct name, then broadcast to pairs)
-    ska, skb = _skeletons(A["name_compact"]), _skeletons(B["name_compact"])
-    F["skel_ratio"] = _cp(ska, skb, fuzz.ratio)
-    F["skel_jw"] = _cp(ska, skb, JaroWinkler.normalized_similarity)
-
-    # formerly-known-as / DBA alternate names: best token-set score over the available spellings
-    if "name_alt" in A.columns and "name_alt" in B.columns:
-        alt_a = A["name_alt"].where(A["name_alt"] != "", A["name_core"]).tolist()
-        alt_b = B["name_alt"].where(B["name_alt"] != "", B["name_core"]).tolist()
-        F["name_alt_tset"] = np.maximum.reduce([
-            _cp(alt_a, b_core, fuzz.token_set_ratio),
-            _cp(a_core, alt_b, fuzz.token_set_ratio),
-            _cp(alt_a, alt_b, fuzz.token_set_ratio),
-        ])
-        F["name_alt_any"] = ((A["name_alt"].values != "") | (B["name_alt"].values != "")).astype(np.float32)
 
     ga, gb = A["name_legal"].values, B["name_legal"].values
     both = (ga > 0) & (gb > 0)

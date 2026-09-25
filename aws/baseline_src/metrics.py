@@ -26,23 +26,6 @@ def macro_f05(pred: dict, gt: dict, s1_ids=None) -> float:
     return float(np.mean([f05(set(pred.get(s, ())), gt.get(s, set())) for s in ids]))
 
 
-def per_entity_f05(pred: dict, gt: dict, s1_ids) -> np.ndarray:
-    """F0.5 of every S1 entity in `s1_ids` (the macro score is their mean)."""
-    return np.array([f05(set(pred.get(s, ())), gt.get(s, set())) for s in s1_ids], dtype=np.float64)
-
-
-def paired_bootstrap(a: np.ndarray, b: np.ndarray, n: int = 1000, seed: int = 0) -> tuple[float, float, float]:
-    """Mean of (b - a) over entities and its 95% bootstrap CI (resampling S1 entities).
-
-    Used to accept a change only when the lower bound is above zero, i.e. when the gain is not
-    just noise in which entities happened to be sampled.
-    """
-    d = np.asarray(b, np.float64) - np.asarray(a, np.float64)
-    rng = np.random.default_rng(seed)
-    means = np.array([d[rng.integers(0, len(d), len(d))].mean() for _ in range(n)])
-    return float(d.mean()), float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
-
-
 def blocking_report(cands: dict, gt: dict, n_targets: int, s1_ids=None) -> dict:
     """Recall ceiling of the candidate set and its size."""
     ids = list(gt) if s1_ids is None else list(s1_ids)
