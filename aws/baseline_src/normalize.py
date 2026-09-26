@@ -8,13 +8,6 @@ terms are included because the test set contains France, which never appears in 
 Native-script names (Devanagari, Tamil, ...) are romanised with unidecode; doubled letters are
 then collapsed everywhere ("limittedd" -> "limited", "street" -> "stret") so transliterations and
 typos land on the same spelling as the reference records.
-
-Nothing in this file branches on the `country` field: every rule (abbreviation, honorific,
-region code, ...) is a plain string-to-string mapping applied unconditionally to whatever text
-is in front of it. That is what makes it safe for an open set of country labels -- a country
-never seen in training (the test set's France) is normalised by exactly the same code path as
-US or India, and adding a future country needs no new branch here, only (optionally) more
-vocabulary entries.
 """
 from __future__ import annotations
 
@@ -26,64 +19,25 @@ from pathlib import Path
 import pandas as pd
 from unidecode import unidecode
 
-# ---------------------------------------------------------------- regexes (defined early: the
-# vocabularies below are built by collapsing doubled letters in their own keys/values, so DOUBLE
-# must exist first)
-DOUBLE = re.compile(r"([a-z])\1+")
-
-
-def _collapse_vocab(d: dict) -> dict:
-    """Rebuild a vocabulary dict so every key (and every string value) is reachable again.
-
-    Every raw token this file looks up has already had its doubled letters removed by DOUBLE
-    (that collapsing happens once, early, so transliterations and typos land on one spelling).
-    A hand-written entry whose key or value still contains a doubled letter -- "poona" (the
-    input is already "pona" by the time it is looked up), "puducherry", "immeuble" -- can then
-    never be reached, or never match its own spelled-out form. Fixing this generically here
-    (once) is safer than re-typing every vocabulary entry by hand: it can't miss one, and a new
-    entry added later inherits the fix automatically. First definition wins on a collision; the
-    original (possibly unreachable) key is also kept, purely so the source stays a literal audit
-    trail of what was written by hand.
-    """
-    out = dict(d)
-    for k, v in d.items():
-        ck = DOUBLE.sub(r"\1", k)
-        cv = DOUBLE.sub(r"\1", v) if isinstance(v, str) else v
-        out.setdefault(ck, cv)
-    return out
-
-
 # ---------------------------------------------------------------- vocabularies
-# Keys are in *collapsed* form after _collapse_vocab (doubled letters removed); as written below
-# they are ordinary human spellings, which is what makes this file readable and editable.
-LEGAL_CANON = _collapse_vocab({
+# Keys are in *collapsed* form (doubled letters removed), values are canonical legal tokens.
+LEGAL_CANON = {
     "incorporated": "inc", "inc": "inc", "incorporation": "inc",
     "corporation": "corp", "corp": "corp", "corpn": "corp",
     "limited": "ltd", "ltd": "ltd", "limitet": "ltd", "ltda": "ltd",
     "private": "pvt", "pvt": "pvt", "pte": "pvt", "praivet": "pvt", "piraivet": "pvt", "prayvet": "pvt",
-    # romanised Devanagari/regional-script abbreviations ("प्रा." / "प्रा॰") for Private / Limited,
-    # mined from true training pairs where one source spells the legal form in English and the
-    # other in a native script: both must collapse to the same "pvt" / "ltd" token.
-    "pra": "pvt", "praibhet": "pvt", "praivr": "pvt", "limird": "ltd",
     "company": "co", "co": "co", "cie": "co", "compagnie": "co",
     "lc": "llc", "lp": "llp", "elelpi": "llp", "plc": "plc", "pc": "pc",
     "gmbh": "gmbh", "ag": "ag", "bv": "bv", "nv": "nv",
     "sa": "sa", "sas": "sas", "sasu": "sas", "sarl": "sarl", "eurl": "eurl",
     "sci": "sci", "snc": "snc", "sca": "sca", "scop": "scop", "selarl": "sarl", "opc": "opc",
-})
+}
 LEGAL_TOKENS = frozenset(LEGAL_CANON.values())
-# legal abbreviations that are too ambiguous on their own (mapped only after another legal form)
-CONTEXT_LEGAL = {"li": "ltd"}
 LEGAL_BITS = {t: 1 << i for i, t in enumerate(sorted(LEGAL_TOKENS))}
 NAME_STOP = frozenset({"the", "and", "of", "le", "la", "les", "de", "des", "du", "et", "l", "d", "a", "an",
-                       "dba", "aka", "ta", "et",
-                       # honorific prefixes mined from true pairs, where one source adds one and
-                       # the other doesn't ("Shri Ramesh Traders" vs "Ramesh Traders"): dropped
-                       # unconditionally, like the other connector words above, not just when
-                       # leading, so both sides land on the same core tokens either way.
-                       "mr", "dr", "shri", "sri", "smt", "messrs"})
+                       "dba", "aka", "ta", "et"})
 
-ADDR_CANON = _collapse_vocab({
+ADDR_CANON = {
     # English
     "rd": "road", "st": "stret", "str": "stret", "street": "stret", "saint": "stret",
     "ave": "avenue", "av": "avenue", "avn": "avenue", "blvd": "boulevard", "bd": "boulevard",
@@ -95,17 +49,12 @@ ADDR_CANON = _collapse_vocab({
     "n": "north", "s": "south", "e": "east", "w": "west",
     "ne": "northeast", "nw": "northwest", "se": "southeast", "sw": "southwest",
     "mt": "mount", "ft": "fort", "ctr": "center", "centre": "center", "unit": "unit",
-    # street-suffix abbreviations that collide with a US state code letter-for-letter (ct/court
-    # vs Connecticut, cv/cove vs no state but a locality suffix, ...): kept here so a segment
-    # that ISN'T recognised as a genuine state/region (see address_fields) still canonicalises
-    # the word as a street term instead of leaving the bare abbreviation unmatched.
-    "cv": "cove", "rdg": "ridge", "xing": "crossing", "pt": "point", "cdp": "",
     # Indian
     "nr": "near", "opp": "oposite", "oposite": "oposite", "sec": "sector", "ph": "phase",
     "chk": "chowk", "mkt": "market", "extn": "extension", "ext": "extension", "indl": "industrial",
     "estt": "estate", "cplx": "complex", "stn": "station", "rly": "railway", "hsg": "housing",
     "soc": "society", "dist": "district", "distt": "district", "tq": "taluk", "tal": "taluk",
-    "gali": "gali", "mg": "mahatma gandhi", "nh": "national highway",
+    "gali": "gali", "mg": "mahatma gandhi",
     # common city renames (both spellings occur)
     "bangalore": "bengaluru", "bengaluru": "bengaluru", "madras": "chenai", "chenai": "chenai",
     "bombay": "mumbai", "calcuta": "kolkata", "kolkata": "kolkata", "baroda": "vadodara",
@@ -118,8 +67,8 @@ ADDR_CANON = _collapse_vocab({
     "cedex": "", "bp": "", "cs": "", "bis": "",
     # junk
     "null": "", "none": "", "na": "",
-})
-STATE_CODES = _collapse_vocab({
+}
+STATE_CODES = {
     # US
     "alabama": "al", "alaska": "ak", "arizona": "az", "arkansas": "ar", "california": "ca",
     "colorado": "co", "conecticut": "ct", "delaware": "de", "florida": "fl", "georgia": "ga",
@@ -155,7 +104,7 @@ STATE_CODES = _collapse_vocab({
     "normandie": "fnor", "pays de la loire": "fpdl", "centre val de loire": "fcvl",
     "bourgogne franche comte": "fbfc", "corse": "fcor", "guadeloupe": "fgua", "martinique": "fmtq",
     "guyane": "fguy", "la reunion": "flre", "reunion": "flre", "mayote": "fmay",
-})
+}
 STATE_RE = re.compile(
     r"\b(" + "|".join(re.escape(k) for k in sorted(STATE_CODES, key=len, reverse=True)) + r")\b"
 )
@@ -164,14 +113,14 @@ REGION_ALIAS = {**{v: v for v in STATE_CODES.values()}, **STATE_CODES, "tg": "ts
 # Telangana was split from Andhra Pradesh in 2014 and the sources mix the two: one block.
 REGION_MERGE = {"ts": "ap"}
 
-# ---------------------------------------------------------------- regexes (continued)
+# ---------------------------------------------------------------- regexes
+DOUBLE = re.compile(r"([a-z])\1+")
 DOMAIN = re.compile(r"(?:https?\W+)?(?:www\.)?([a-z0-9][a-z0-9-]*)\.(?:com|net|org|co|in|fr|biz|info|us|io)\b(?:\.[a-z]{2})?")
 DOTTED = re.compile(r"(?<![a-z0-9])([a-z])\.(?=[a-z]\b)")    # s.a.r.l. -> sarl, p.l.c -> plc
 NON_ALNUM = re.compile(r"[^a-z0-9]+")
 ORDINAL = re.compile(r"(\d+)(?:st|nd|rd|th|er|eme|e)\b")
-# PO boxes, PMB (US private-mailbox) codes, <NULL> placeholders and number prefixes ("No.",
-# "S No." survey number, "Door No", "#").
-JUNK = re.compile(r"<null>|\bp\.?\s?o\.?\s+box\s*\d*|\bpost box\s*\d*|\bpmb\s*\d*|"
+# PO boxes, <NULL> placeholders and number prefixes ("No.", "S No." survey number, "Door No", "#").
+JUNK = re.compile(r"<null>|\bp\.?\s?o\.?\s+box\s*\d*|\bpost box\s*\d*|"
                   r"\b(?:s|sy|survey|door|plot|flat|shop|house|h)?\s?\.?\s?no\b\.?|#")
 LANDMARK = re.compile(
     r"\b(?:near|nr|opp|opposite|behind|beside|next to|adjacent to|in front of|close to|"
@@ -179,18 +128,6 @@ LANDMARK = re.compile(
 )
 NUM = re.compile(r"\d+")
 POSTAL = re.compile(r"(?<!\d)(\d{5,6})(?!\d)")
-
-# A leading "M/s" / "M/s." (Messrs, a very common Indian business-name prefix meaning roughly
-# "the firm of") is stripped as a unit before tokenisation. Left alone, "/" is turned into a
-# space by NON_ALNUM and "m" and "s" become two ordinary single-letter tokens -- far too risky
-# to blanket-drop (real initials), but safe to strip as this one specific, anchored prefix.
-MS_PREFIX = re.compile(r"^m\s*/\s*s\.?\s+")
-# A formerly-known-as / doing-business-as marker splits a name into a primary and an alternate
-# spelling (the alternate is kept for a separate fuzzy-match feature, not folded into name_core).
-ALT_SPLIT = re.compile(
-    r"\b(?:formerly known as|formerly|f\s*/?\s*k\s*/?\s*a|a\s*/?\s*k\s*/?\s*a|"
-    r"d\s*/?\s*b\s*/?\s*a|doing business as|t\s*/\s*a|trading as)\b"
-)
 
 
 def _latin(s: str) -> tuple[str, bool]:
@@ -201,40 +138,20 @@ def _latin(s: str) -> tuple[str, bool]:
     return unidecode(s).lower(), nonlatin
 
 
-def _core_tokens(s: str) -> tuple[list[str], list[str]]:
-    """Shared name cleanup: domain/&/dotted-abbreviation handling, doubled-letter collapse,
-    legal-suffix canonicalisation, stopword removal. Returns (all tokens, core tokens)."""
+def name_fields(raw: str) -> tuple:
+    s, nonlatin = _latin(raw or "")
     s = DOMAIN.sub(r" \1 ", s)
     s = s.replace("&", " and ").replace("+", " and ").replace("'", "").replace("`", "")
     s = DOTTED.sub(r"\1", s)
     s = DOUBLE.sub(r"\1", NON_ALNUM.sub(" ", s))
     toks = [LEGAL_CANON.get(t, t) for t in s.split()]
-    # "li" is the romanised native-script abbreviation of Limited ("pra. li."), but also a real
-    # name/surname, so it counts as a legal form only right after another legal form.
-    for i in range(1, len(toks)):
-        if toks[i] in CONTEXT_LEGAL and toks[i - 1] in LEGAL_TOKENS:
-            toks[i] = CONTEXT_LEGAL[toks[i]]
     core = [t for t in toks if t not in LEGAL_TOKENS and t not in NAME_STOP]
     if not core:
         core = [t for t in toks if t not in NAME_STOP] or toks
-    return toks, core
-
-
-def name_fields(raw: str) -> tuple:
-    s, nonlatin = _latin(raw or "")
-    s = MS_PREFIX.sub("", s)
-    alt = ""
-    m = ALT_SPLIT.search(s)
-    if m:
-        alt, s = s[m.end():], s[:m.start()]
-        if not s.strip() and alt.strip():  # the marker was at position 0: alt is the real name
-            s, alt = alt, ""
-    toks, core = _core_tokens(s)
     legal = 0
     for t in toks:
         legal |= LEGAL_BITS.get(t, 0)
-    alt_core = _core_tokens(alt)[1] if alt.strip() else []
-    return (" ".join(toks), " ".join(core), "".join(core), legal, nonlatin, " ".join(alt_core))
+    return (" ".join(toks), " ".join(core), "".join(core), legal, nonlatin)
 
 
 def _num(t: str) -> str:
@@ -244,28 +161,16 @@ def _num(t: str) -> str:
 def address_fields(raw: str) -> tuple:
     """(clean, alpha, numbers, postal, landmark, nonlatin, region).
 
-    Segment-aware: a comma segment that is just a state / region ("..., FL" / "TX, AUSTIN, ...",
-    "Pune, Maharashtra 411001") gives the record's region and is kept as a code. Two structural
-    checks (not tied to any specific state or country) keep this from misfiring:
-      - a segment's letters must match a region on their own AND its digits (if any) must be a
-        plausible postal code (5-6 digits) -- otherwise "Fl 0" (a floor) or ".../Hr/16" (a house
-        number) would be read as Florida / Haryana just because they share two letters with it;
-      - the last short word of a segment is only promoted to a region code when that segment is
-        the address's last, or carries a postal code -- otherwise a street suffix that happens to
-        collide with a state code ("Oak Ct", "Commerce Ave, Cove Cv") would never canonicalise to
-        "court" / "cove".
-    When several region-only segments disagree, all of them are returned ("dc|wa"); the choice is
-    made per country from data in regions.resolve_regions (never by segment order, which differs
-    between sources).
+    Segment-aware: a comma segment that is just a state / region ("..., FL", "TX, AUSTIN, ...",
+    "Pune, Maharashtra 411001") gives the record's region and is kept as a code, so state codes
+    are never mistaken for abbreviations (FL is not "floor", CT is not "court").
     """
     s, nonlatin = _latin(raw or "")
     s = JUNK.sub(" ", s)
     s = DOTTED.sub(r"\1", ORDINAL.sub(r"\1", s))
-    raw_segs = re.split(r"[,;\n]", s)
-    last_idx = max((i for i, sg in enumerate(raw_segs) if sg.strip()), default=-1)
     toks, landmarks = [], []
-    strong, medium = {}, ""   # strong: every region-only segment, in order (dict = ordered set)
-    for i, seg in enumerate(raw_segs):
+    strong = medium = ""
+    for seg in re.split(r"[,;\n]", s):
         m = LANDMARK.search(seg)
         if m:
             landmarks.append(m.group(0))
@@ -273,17 +178,14 @@ def address_fields(raw: str) -> tuple:
         words = DOUBLE.sub(r"\1", NON_ALNUM.sub(" ", seg)).split()
         if not words:
             continue
-        digits = [w for w in words if w.isdigit()]
-        has_postal = len(digits) == 1 and len(digits[0]) in (5, 6)
         alpha = " ".join(w for w in words if not w.isdigit())
-        if alpha in REGION_ALIAS and (not digits or has_postal):
-            r = REGION_ALIAS[alpha]
-            strong[REGION_MERGE.get(r, r)] = None
-            toks += [_num(w) for w in digits] + [r]
+        if alpha in REGION_ALIAS:
+            strong = REGION_ALIAS[alpha]
+            toks += [_num(w) if w.isdigit() else "" for w in words] + [strong]
             continue
         alpha_words = [w for w in words if not w.isdigit()]
         last = alpha_words[-1] if len(alpha_words) >= 2 else ""
-        if last in REGION_ALIAS and len(last) <= 3 and (i == last_idx or has_postal):
+        if last in REGION_ALIAS and len(last) <= 3:   # "denver co 80202", "pune mh"
             medium = REGION_ALIAS[last]
         for w in words:
             if w.isdigit():
@@ -297,22 +199,16 @@ def address_fields(raw: str) -> tuple:
     for m in STATE_RE.finditer(out):
         weak = STATE_CODES[m.group(1)]
     out = STATE_RE.sub(lambda m: STATE_CODES[m.group(1)], out)
-    if strong:
-        # Several region-only segments that disagree ("Oor, ..., West Bengal", "DC, ...,
-        # Washington") are kept as sorted candidates "or|wb"; regions.resolve_regions picks one per
-        # country from data, so both orderings of the same address resolve identically.
-        region = "|".join(sorted(strong))
-    else:
-        region = medium or weak
-        region = REGION_MERGE.get(region, region)
+    region = strong or medium or weak
+    region = REGION_MERGE.get(region, region)
     landmark = DOUBLE.sub(r"\1", NON_ALNUM.sub(" ", " ".join(landmarks))).strip()
     nums = NUM.findall(out)
     pm = POSTAL.findall(out)
-    alpha_out = " ".join(t for t in out.split() if not t.isdigit())
-    return (out, alpha_out, " ".join(dict.fromkeys(nums)), pm[-1] if pm else "", landmark, nonlatin, region)
+    alpha = " ".join(t for t in out.split() if not t.isdigit())
+    return (out, alpha, " ".join(dict.fromkeys(nums)), pm[-1] if pm else "", landmark, nonlatin, region)
 
 
-NAME_COLS = ["name_clean", "name_core", "name_compact", "name_legal", "name_nonlatin", "name_alt"]
+NAME_COLS = ["name_clean", "name_core", "name_compact", "name_legal", "name_nonlatin"]
 ADDR_COLS = ["addr_clean", "addr_alpha", "addr_numbers", "postal", "addr_landmark", "addr_nonlatin", "region"]
 
 

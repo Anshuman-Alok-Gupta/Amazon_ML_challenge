@@ -36,9 +36,8 @@ from config import (DEFAULT_ARTIFACT_DIR, DEFAULT_CACHE_DIR, DEFAULT_DATA_DIR,  
 from features import build_features  # noqa: E402
 from io_utils import (CAND_HEADER, MATCH_HEADER, check_pairs, gt_dict, load_split,  # noqa: E402
                       read_ground_truth, read_source, write_pairs)  # noqa: E402
-from metrics import blocking_report, macro_f05, paired_bootstrap, per_entity_f05  # noqa: E402
-from postprocess import select_with, to_lists, tune_expected_f, tune_threshold  # noqa: E402
-from regions import drop_regions, infer_regions, rare_regions, region_freq, resolve_regions  # noqa: E402
+from metrics import blocking_report, macro_f05  # noqa: E402
+from postprocess import select, select_pairs, tune_threshold  # noqa: E402
 
 PAIR_COLS = ["s1_id", "cand_id", "source", "country"]
 
@@ -65,7 +64,7 @@ class Timer:
 
 
 # ------------------------------------------------------------------ data
-FEATURE_COLS = ["entity_id", "country", "name_clean", "name_core", "name_legal", "name_nonlatin", "name_alt",
+FEATURE_COLS = ["entity_id", "country", "name_clean", "name_core", "name_legal", "name_nonlatin",
                 "addr_clean", "addr_numbers", "postal", "addr_landmark", "addr_nonlatin", "region"]
 
 
@@ -101,14 +100,6 @@ class SplitData:
         gt_path = d / f"{split}_ground_truth.tsv"
         self.gt = read_ground_truth(gt_path) if gt_path.exists() else None
         s1 = pd.read_parquet(self.paths["s1"], columns=["entity_id", "country", "country_norm", "region"])
-        # data-driven, per country label (see regions.py): ambiguous region candidates are resolved
-        # by the country's own region frequencies, and regions too rare to be real are dropped
-        self.freq = region_freq(s1["country_norm"], s1["region"])
-        s1["region"] = self._resolve(s1)
-        self.rare = rare_regions(s1["country_norm"], s1["region"])
-        s1["region"] = s1["region"].where(
-            ~pd.Series([r in self.rare.get(c, ()) for c, r in zip(s1["country_norm"], s1["region"])],
-                       index=s1.index), "")
         self.keep_regions = None
         if subset:
             rng = np.random.default_rng(SEED)
@@ -123,15 +114,6 @@ class SplitData:
         self.s1_ids = s1["entity_id"].to_numpy()
         self.s1_country = s1["country"].to_numpy()
         self.countries = sorted(s1["country_norm"].unique())
-
-    def _resolve(self, df: pd.DataFrame, country: str | None = None) -> pd.Series:
-        """Region column with multi-candidate values resolved (per row country, or `country`)."""
-        if country is not None:
-            return resolve_regions(df["region"], self.freq.get(country, {}))
-        out = df["region"].copy()
-        for c, idx in df.groupby("country_norm").groups.items():
-            out.loc[idx] = resolve_regions(df.loc[idx, "region"], self.freq.get(c, {}))
-        return out
 
     def _mask(self, df: pd.DataFrame, is_target: bool) -> np.ndarray:
         """Rows kept by the dev subset (all rows when no subset is set)."""
@@ -152,8 +134,6 @@ class SplitData:
         out = []
         for k in ("s2", "s3"):
             t = pd.read_parquet(self.paths[k], columns=cols)
-            if self.keep_regions is not None:  # dev subset: match regions the way load() does
-                t["region"] = self._resolve(t)
             out.append(t["entity_id"].to_numpy()[self._mask(t, is_target=True)])
         return set(np.concatenate(out))
 
@@ -162,17 +142,6 @@ class SplitData:
         s1 = pd.read_parquet(self.paths["s1"], columns=cols, filters=f)
         tgt = make_target(pd.read_parquet(self.paths["s2"], columns=cols, filters=f),
                           pd.read_parquet(self.paths["s3"], columns=cols, filters=f))
-        if "region" in s1.columns:
-            s1["region"], tgt["region"] = self._resolve(s1, country), self._resolve(tgt, country)
-            bad = self.rare.get(country, set())
-            s1, tgt = drop_regions(s1, bad), drop_regions(tgt, bad)
-            n_empty = int((tgt["region"] == "").sum())
-            s1, tgt, n_filled = infer_regions(s1, tgt)
-            reg = s1["region"].value_counts()
-            print(f"  {country}: {len(reg)} regions ({', '.join(f'{r}={n:,}' for r, n in reg.items() if r)}); "
-                  f"dropped rare {sorted(bad) if bad else '-'}; region-less targets "
-                  f"{n_empty:,} -> {int((tgt['region'] == '').sum()):,} (inferred {n_filled:,} records)",
-                  flush=True)
         if self.keep_regions is not None:
             regs = list(self.keep_regions.get(country, ()))
             s1 = s1[np.isin(s1["region"].to_numpy(), regs)].reset_index(drop=True)
@@ -344,26 +313,16 @@ def train_frame(args):
 
 
 def fit_with_cv(pairs, X, y, gt, s1_ids, mcfg: ModelConfig, pcfg: PostConfig):
-    """CV -> out-of-fold probs -> tuned decoder -> refit on everything.
-
-    Two decoders are compared on the OOF probabilities: the global threshold, and per-S1
-    expected-F0.5 decoding (see postprocess.select_expected_f). Each has exactly one tuned
-    number (threshold / floor), picked by the same plateau-middle rule; the decoder with the
-    higher OOF score is kept. Returns (booster, scored, decoder, threshold, oof_f05).
-    """
+    """CV -> out-of-fold probs -> tuned threshold -> refit on everything."""
     with Timer("cv"):
         oof, iters = mdl.train_cv(X, y, pairs["s1_id"].values, mcfg)
     scored = pairs[["s1_id", "cand_id"]].assign(prob=oof)
     thr, f = tune_threshold(scored, gt, s1_ids, pcfg.exclusive_candidates)
     print(f"  OOF macro F0.5 = {f:.4f} @ threshold {thr} (exclusive={pcfg.exclusive_candidates})")
-    floor, f_e = tune_expected_f(scored, gt, s1_ids, pcfg.exclusive_candidates)
-    print(f"  OOF macro F0.5 = {f_e:.4f} with expected-F decoding, floor {floor}")
-    decoder, thr, f = ("expected_f", floor, f_e) if f_e > f else ("threshold", thr, f)
-    print(f"  decoder: {decoder} @ {thr}")
     rounds = int(np.mean(iters) * 1.1)
     with Timer(f"refit ({rounds} rounds)"):
         booster = mdl.fit(X, y, mcfg, rounds)
-    return booster, scored, decoder, thr, f
+    return booster, scored, thr, f
 
 
 # ------------------------------------------------------------------ commands
@@ -383,19 +342,19 @@ def cmd_train(args):
     stage1, pairs, X, y, gt, countries, brep = train_frame(args)
     print(f"  train pairs {len(pairs):,}, positives {y.mean():.3f}, features {X.shape[1]}")
     ids = countries.index.tolist()
-    booster, scored, decoder, thr, f = fit_with_cv(pairs, X, y, gt, ids, mcfg, pcfg)
-    pred = to_lists(select_with(scored, thr, pcfg.exclusive_candidates, decoder))
+    booster, scored, thr, f = fit_with_cv(pairs, X, y, gt, ids, mcfg, pcfg)
+    pred = select(scored, thr, pcfg.exclusive_candidates)
     for c, cid in countries.groupby(countries).groups.items():
         print(f"  OOF F0.5 [{c}] = {macro_f05(pred, gt, cid):.4f}  (n={len(cid)})")
-    per = pd.DataFrame({"s1_id": ids, "country": countries.loc[ids].to_numpy(),
-                        "f05": per_entity_f05(pred, gt, ids)})
+    # [bench patch: reporting only] per-entity OOF F0.5 for the paired bootstrap vs the new code
+    from metrics import f05
     Path(args.artifact_dir).mkdir(parents=True, exist_ok=True)
-    per.to_parquet(Path(args.artifact_dir) / "oof_entity_f05.parquet", index=False)
-    if args.baseline:
-        compare_to_baseline(per, Path(args.baseline))
+    pd.DataFrame({"s1_id": ids, "country": countries.loc[ids].to_numpy(),
+                  "f05": [f05(set(pred.get(s, ())), gt.get(s, set())) for s in ids]}
+                 ).to_parquet(Path(args.artifact_dir) / "oof_entity_f05.parquet", index=False)
     if args.dump_errors:
         dump_errors(scored, pred, gt, ids, args)
-    mdl.save(booster, {"features": list(X.columns), "threshold": thr, "decoder": decoder,
+    mdl.save(booster, {"features": list(X.columns), "threshold": thr,
                        "exclusive": pcfg.exclusive_candidates, "oof_macro_f05": f, "blocking": brep},
              args.artifact_dir)
     stage1.save_model(str(Path(args.artifact_dir) / "stage1.txt"))
@@ -416,11 +375,11 @@ def cmd_validate(args):
         print(f"\n== hold out country {c!r}")
         ids_tr = countries.index[countries != c].tolist()
         ids_te = countries.index[countries == c].tolist()
-        booster, _, decoder, thr, _ = fit_with_cv(pairs[tr].reset_index(drop=True), X[tr].reset_index(drop=True),
-                                                  y[tr], gt, ids_tr, mcfg, pcfg)
+        booster, _, thr, _ = fit_with_cv(pairs[tr].reset_index(drop=True), X[tr].reset_index(drop=True),
+                                         y[tr], gt, ids_tr, mcfg, pcfg)
         scored = pairs.loc[te, ["s1_id", "cand_id"]].assign(prob=booster.predict(X[te]))
-        pred = to_lists(select_with(scored, thr, pcfg.exclusive_candidates, decoder))
-        print(f"  unseen-country F0.5 [{c}] = {macro_f05(pred, gt, ids_te):.4f} ({decoder} @ {thr})")
+        pred = select(scored, thr, pcfg.exclusive_candidates)
+        print(f"  unseen-country F0.5 [{c}] = {macro_f05(pred, gt, ids_te):.4f} @ threshold {thr}")
 
 
 def cmd_predict(args):
@@ -436,7 +395,7 @@ def cmd_predict(args):
     generate(data, bcfg, None, stage1, score)
     scored = pd.concat(parts, ignore_index=True)
     del parts
-    matches = select_with(scored, meta["threshold"], meta["exclusive"], meta.get("decoder", "threshold"))
+    matches = select_pairs(scored, meta["threshold"], meta["exclusive"])
 
     problems = check_pairs(matches, scored, data.s1_ids, data.target_ids())
     if problems:
@@ -451,27 +410,6 @@ def cmd_predict(args):
     print(summary.to_string())
     print(f"candidates: {len(scored):,} pairs ({len(scored) / len(data.s1_ids):.1f} per S1); "
           f"matches: {len(matches):,}; wrote {out}")
-
-
-def compare_to_baseline(per: pd.DataFrame, baseline: Path):
-    """Paired bootstrap of per-entity OOF F0.5 against an earlier run's oof_entity_f05.parquet.
-
-    Only S1 entities scored in both runs are compared. A change is worth keeping when the lower
-    95% bound of the gain is above zero overall and no country's mean gain is negative.
-    """
-    if baseline.is_dir():
-        baseline = baseline / "oof_entity_f05.parquet"
-    base = pd.read_parquet(baseline)
-    m = per.merge(base[["s1_id", "f05"]], on="s1_id", suffixes=("", "_base"))
-    if m.empty:
-        print(f"  baseline {baseline}: no common S1 entities")
-        return
-    d, lo, hi = paired_bootstrap(m["f05_base"].to_numpy(), m["f05"].to_numpy())
-    print(f"  vs baseline ({len(m):,} common S1): dF0.5 = {d:+.4f}  95% CI [{lo:+.4f}, {hi:+.4f}]"
-          f"  -> {'KEEP' if lo > 0 else 'not significant'}")
-    for c, g in m.groupby("country"):
-        d, lo, hi = paired_bootstrap(g["f05_base"].to_numpy(), g["f05"].to_numpy())
-        print(f"    [{c}] dF0.5 = {d:+.4f}  95% CI [{lo:+.4f}, {hi:+.4f}]  (n={len(g):,})")
 
 
 def dump_errors(scored, pred, gt, ids, args):
@@ -528,8 +466,6 @@ def main(argv=None):
     ap.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     ap.add_argument("--sample", type=int, default=None, help="number of train S1 entities to use")
     ap.add_argument("--dump-errors", action="store_true", help="write OOF FP/FN pairs for analysis")
-    ap.add_argument("--baseline", type=Path, default=None,
-                    help="artifact dir (or oof_entity_f05.parquet) of an earlier run: paired bootstrap vs it")
     ap.add_argument("--reuse-stage1", action="store_true", help="reuse artifacts/stage1.txt instead of refitting")
     ap.add_argument("--subset", type=float, default=None,
                     help="dev mode: train on a seeded fraction of regions (e.g. 0.15)")

@@ -6,9 +6,11 @@ records per split on a 16 GB laptop.
 
 ```
 TSVs -> normalize (parallel, parquet cache)
-     -> per country: IDF-weighted sparse token index -> top-k retrieval (name / address / both)
+     -> per country: drop noise regions, infer missing regions from the country's own records
+     -> per (country, region) block: IDF-weighted sparse token index -> top-k retrieval (name / address / both)
      -> pairwise features (rapidfuzz, sparse token overlap, rank context, target-side competition)
-     -> LightGBM match probability -> one S1 per target record + threshold tuned for macro F0.5
+     -> LightGBM match probability -> one S1 per target record
+     -> decoder chosen on OOF: global threshold, or per-S1 expected-F0.5 (both tuned for macro F0.5)
      -> output/matching_results.tsv, output/candidate_pairs.tsv
 ```
 
@@ -38,6 +40,7 @@ python src/pipeline.py predict      # full test set -> ../../output/*.tsv
 python src/pipeline.py all          # train + predict (full reproduction)
 ```
 Options: `--sample N` (train S1 sample size), `--dump-errors` (OOF FP/FN pairs to `artifacts/`),
+`--baseline DIR` (paired bootstrap of per-entity OOF F0.5 against an earlier run's artifacts),
 `--min-free-gb` (abort instead of swapping when free RAM falls below this, default 1.5).
 
 Then run the official checker from `student_resource/`:
@@ -56,6 +59,8 @@ Build the final zip with `python src/package_submission.py --team <team_name>`.
 | `src/blocking.py` | per-country token index, sparse top-k retrieval, target-side best-S1 scores |
 | `src/features.py` | vectorised pair features |
 | `src/model.py` | GroupKFold LightGBM, refit, save/load |
-| `src/postprocess.py` | exclusive assignment, threshold tuned for macro F0.5 |
-| `src/metrics.py` | macro F0.5 as defined by the challenge (singletons included), blocking recall ceiling |
+| `src/regions.py` | per-country region sanity (rare regions dropped) and region inference learned from the split's own records -- no place-name tables, same code for every country |
+| `src/postprocess.py` | exclusive assignment; global-threshold or per-S1 expected-F0.5 decoding |
+| `src/metrics.py` | macro F0.5 as defined by the challenge (singletons included), per-entity scores, paired bootstrap, blocking recall ceiling |
+| `src/mine_vocab.py` | audit trail: mines noise vocabulary (abbreviations, honorifics, legal forms) from true pairs of stage-1 sample A only |
 | `src/pipeline.py` | CLI; streams one country at a time |
