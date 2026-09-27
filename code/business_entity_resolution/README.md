@@ -39,24 +39,31 @@ Override with `--data-dir` / `ER_DATA_DIR`. Normalised parquet caches go to `cac
 
 ## Reproduce the final submission (from this folder)
 ```bash
-# 1. stage-1 re-ranker and the cross-encoder, trained on the standard (un-hidden) training data
+# 1. stage-1 re-ranker, trained on the standard (un-hidden) training data
 python src/pipeline.py train --sample 400000                 # samples A/B/C, stage-1 re-ranker -> artifacts/stage1.txt
-python src/pipeline.py ce-train                              # cross-encoder on sample C (downloads e5-small once)
-# 2. matcher at the test set's distractor density, reusing both models
-python src/pipeline.py train --sample 400000 --hide-s1 auto --reuse-stage1  # level-0 model, training frame
+# 2. matcher at the test set's distractor density, reusing stage 1
+python src/pipeline.py train --sample 400000 --hide-s1 auto --reuse-stage1  # level-0 model, training frames
 python src/pipeline.py predict                               # test blocking + features -> cache/frames/test
-python src/pipeline.py ce-score --ce-band 0.02 0.98          # cross-encoder scores for the train / test frames
+# 3. cross-encoder on a GPU (we used a Colab A100): all of sample C, every train / test pair scored
+python src/pipeline.py ce-train --ce-full                    # downloads e5-small once -> artifacts/ce_model
+python src/pipeline.py ce-score --ce-full                    # -> cache/frames/{train,test}/ce.parquet
+# 4. stacked matcher
 python src/pipeline.py stack                                 # level 1 + level 2, ablation -> artifacts/stack.json
 python src/pipeline.py stack-predict                         # -> ../../output/matching_results.tsv, candidate_pairs.tsv
 ```
 - `--hide-s1 auto` hides a data-measured share of training S1 entities (about 18.7%) so that
   training has the test set's density of unmatched records. The hidden entities come from
-  outside samples A, B and C, which is why the stage-1 model and the cross-encoder from step 1
-  can be reused. The run prints `hide-s1 auto: ... h=`.
+  outside samples A, B and C, which is why the stage-1 model from step 1 can be reused. The run
+  prints `hide-s1 auto: ... h=`.
+- Step 3 needs a CUDA GPU (about 20 min to train and 40 min to score on an A100; float16 is used
+  automatically on older GPUs such as the T4). On CPU only, drop `--ce-full`: the cross-encoder
+  then trains on 300k pairs and scores only pairs with level-0 probability in [0.02, 0.98]
+  (the 0.977 leaderboard submission; about 5 h on 8 vCPU).
+- A second cross-encoder becomes a second stack feature with `--ce-name`, e.g.
+  `ce-train --ce-full --ce-model intfloat/multilingual-e5-base --ce-name base` and the same flags
+  for `ce-score` (column `ce_base_logit`).
 - `train` and `predict` cache their model inputs under `cache/frames/`, so the later
   commands never regenerate candidates.
-- On CPU the cross-encoder trains on 300k pairs and scores only pairs with level-0 probability
-  in [0.02, 0.98]; `--ce-full` trains on all of sample C and scores every pair (GPU).
 - A guard aborts a command when free RAM falls below `--min-free-gb` (default 1.5); pass
   `--min-free-gb 0` on a dedicated machine. The full run needs about 30 GB of RAM (EC2
   m7i.2xlarge).
@@ -73,8 +80,8 @@ only the new pairs), `--reuse-stage1` (reuse `artifacts/stage1.txt`), `--use-cat
 to level 1 in `stack`), `--baseline DIR` (paired bootstrap of per-entity OOF F0.5 against an
 earlier run), `--dump-errors` (OOF false positives / negatives to `artifacts/`).
 
-Results of the final run (EC2 m7i.2xlarge, CPU only): OOF macro F0.5 0.9838 (US 0.9862, India
-0.9804) at test density, 0.977 on the public leaderboard.
+Results of the final run (EC2 m7i.2xlarge for everything but step 3): OOF macro F0.5 0.9852
+(US 0.9872, India 0.9821) at test density, 0.979 on the public leaderboard.
 
 Then run the official checker from `student_resource/`:
 ```bash

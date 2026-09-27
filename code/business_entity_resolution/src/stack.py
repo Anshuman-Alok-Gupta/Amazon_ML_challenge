@@ -266,8 +266,9 @@ def train(fdir: Path, target_paths, gt: dict, art: Path, tune_decoder, scfg: Sta
     ids, country = s1["s1_id"].tolist(), s1["country"].to_numpy(object)
     y, folds = pairs["y"].to_numpy(np.int8), pairs["fold"].to_numpy()
     has_ce = (fdir / "ce.parquet").exists()
-    if has_ce:
-        X["ce_logit"] = pd.read_parquet(fdir / "ce.parquet")["ce_logit"].to_numpy(np.float32)
+    if has_ce:  # one column per cross-encoder (ce_logit, and e.g. ce_base_logit)
+        for c, v in pd.read_parquet(fdir / "ce.parquet").items():
+            X[c] = v.to_numpy(np.float32)
     print(f"stack: {len(pairs):,} pairs, {X.shape[1]} level-0 features (cross-encoder: {has_ce}), "
           f"gpu={gpu}", flush=True)
 
@@ -407,7 +408,8 @@ def predict(fdir: Path, target_paths, art: Path) -> tuple[pd.DataFrame, dict]:
         P = pairs.iloc[a:b].reset_index(drop=True)
         X = read_rows(fdir / "X.parquet", a, b)
         if spec["has_ce"]:
-            X["ce_logit"] = read_rows(fdir / "ce.parquet", a, b)["ce_logit"].to_numpy(np.float32)
+            for c, v in read_rows(fdir / "ce.parquet", a, b).items():
+                X[c] = v.to_numpy(np.float32)
         X = X[spec["features"]]
         L = {"lgb": logit(lgb_m.predict(X)) if lgb_m is not None else logit(P["prob"].to_numpy())}
         if xgb_m is not None:

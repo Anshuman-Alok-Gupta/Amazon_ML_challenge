@@ -579,7 +579,16 @@ def ce_config(args):
         cfg.max_train_pairs, cfg.band = None, None
     if args.ce_band:
         cfg.band = tuple(args.ce_band)
+    if args.ce_model:
+        cfg.model = args.ce_model
     return cfg
+
+
+def ce_names(args) -> tuple[str, Path]:
+    """Feature column and model dir of a cross-encoder: ce_logit / ce_model, or with --ce-name base
+    ce_base_logit / ce_model_base (several cross-encoders become several stack features)."""
+    sfx = f"_{args.ce_name}" if args.ce_name else ""
+    return f"ce{sfx}_logit", Path(args.artifact_dir) / f"ce_model{sfx}"
 
 
 def cmd_ce_train(args):
@@ -591,8 +600,9 @@ def cmd_ce_train(args):
         texts = ce.load_texts(cache_paths(args, "train").values(), np.r_[pairs["s1_id"], pairs["cand_id"]])
         a, b = ce.pair_texts(pairs, texts)
     with Timer("cross-encoder train"):
-        rep = ce.train(a, b, pairs["y"].to_numpy(np.float32), Path(args.artifact_dir) / "ce_model", cfg)
-    (Path(args.artifact_dir) / "ce_report.json").write_text(json.dumps({**rep, "model": cfg.model}, indent=2))
+        col, mdir = ce_names(args)
+        rep = ce.train(a, b, pairs["y"].to_numpy(np.float32), mdir, cfg)
+    (mdir.parent / f"{mdir.name}_report.json").write_text(json.dumps({**rep, "model": cfg.model}, indent=2))
 
 
 def cmd_ce_score(args):
@@ -604,14 +614,18 @@ def cmd_ce_score(args):
     """
     import cross_encoder as ce
     cfg = ce_config(args)
+    col, mdir = ce_names(args)
     for split in ("train", "test"):
         fdir = frame_dir(args, split)
         pairs = pd.read_parquet(fdir / "pairs.parquet", columns=["s1_id", "cand_id", "prob"])
         out = np.full(len(pairs), np.nan, np.float32)
+        table = pd.DataFrame(index=pd.RangeIndex(len(pairs)))  # other cross-encoders' columns are kept
         if (fdir / "ce.parquet").exists():
-            prev = pd.read_parquet(fdir / "ce.parquet")["ce_logit"].to_numpy(np.float32)
+            prev = pd.read_parquet(fdir / "ce.parquet")
             if len(prev) == len(pairs):
-                out = prev.copy()  # parquet-backed arrays are read-only
+                table = prev
+                if col in prev:
+                    out = prev[col].to_numpy(np.float32).copy()  # parquet-backed arrays are read-only
         m = ce.band_mask(pairs["prob"].to_numpy(), cfg.band) & np.isnan(out)
         print(f"  {split}: scoring {m.sum():,} of {len(pairs):,} pairs (band {cfg.band}; "
               f"{(~np.isnan(out)).sum():,} already scored)", flush=True)
@@ -620,8 +634,9 @@ def cmd_ce_score(args):
             texts = ce.load_texts(cache_paths(args, split).values(), np.r_[sub["s1_id"], sub["cand_id"]])
             a, b = ce.pair_texts(sub, texts)
             del texts
-            out[m] = ce.score(Path(args.artifact_dir) / "ce_model", a, b, cfg)
-        pd.DataFrame({"ce_logit": out}).to_parquet(fdir / "ce.parquet", index=False)
+            out[m] = ce.score(mdir, a, b, cfg)
+        table[col] = out
+        table.to_parquet(fdir / "ce.parquet", index=False)
         del pairs, sub, a, b
         release_memory()
 
@@ -750,6 +765,11 @@ def main(argv=None):
                     help="dev mode: train on a seeded fraction of regions (e.g. 0.15)")
     ap.add_argument("--hide-s1", default="0",
                     help="train: hide this fraction of train S1 ('auto' = match test's targets per S1)")
+    ap.add_argument("--ce-model", default=None,
+                    help="cross-encoder: Hugging Face base model (default intfloat/multilingual-e5-small)")
+    ap.add_argument("--ce-name", default="",
+                    help="cross-encoder: name of an additional cross-encoder, e.g. base -> ce_base_logit, "
+                         "artifacts/ce_model_base")
     ap.add_argument("--use-cat", action="store_true",
                     help="stack: add CatBoost as a level-1 learner (slow on CPU)")
     ap.add_argument("--min-free-gb", type=float, default=1.5,

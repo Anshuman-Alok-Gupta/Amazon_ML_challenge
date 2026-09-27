@@ -49,16 +49,25 @@ def _device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def _half(device):
+    """Autocast dtype: bfloat16, except float16 on CUDA GPUs older than Ampere (T4, P100, V100),
+    which have no native bfloat16."""
+    import torch
+    if device.type == "cuda" and torch.cuda.get_device_capability(device)[0] < 8:
+        return torch.float16
+    return torch.bfloat16
+
+
 def _autocast(device):
-    """bfloat16 autocast on CUDA, and on CPUs with native bf16 (AMX / AVX512-BF16, e.g. EC2 m7i);
-    elsewhere bf16 is emulated and slower than float32."""
+    """Half-precision autocast on CUDA (see _half), and bfloat16 on CPUs with native bf16
+    (AMX / AVX512-BF16, e.g. EC2 m7i); elsewhere bf16 is emulated and slower than float32."""
     import torch
     if device.type == "cpu":
         cpu = torch.cpu
         native = getattr(cpu, "_is_amx_tile_supported", lambda: False)() or             getattr(cpu, "_is_avx512_bf16_supported", lambda: False)()
         if not native:
             return nullcontext()
-    return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+    return torch.autocast(device_type=device.type, dtype=_half(device))
 
 
 def _lengths(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -107,6 +116,8 @@ def train(a: np.ndarray, b: np.ndarray, y: np.ndarray, out_dir: Path, cfg: CECon
     opt = torch.optim.AdamW([q for q in model.parameters() if q.requires_grad], lr=cfg.lr, weight_decay=0.01)
     sched = get_linear_schedule_with_warmup(opt, int(cfg.warmup * steps), steps)
     loss_fn = torch.nn.BCEWithLogitsLoss()
+    # float16 needs loss scaling; with bfloat16 / float32 the scaler is a no-op
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and _half(device) == torch.float16)
     print(f"  cross-encoder {cfg.model} on {device}: {len(tr):,} train / {len(va):,} val pairs, "
           f"{steps:,} steps", flush=True)
 
@@ -122,9 +133,11 @@ def train(a: np.ndarray, b: np.ndarray, y: np.ndarray, out_dir: Path, cfg: CECon
             with _autocast(device):
                 logit = model(**enc).logits.squeeze(-1)
             loss = loss_fn(logit.float(), y_t[rows].to(device))
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
             sched.step()
             opt.zero_grad(set_to_none=True)
             step += 1

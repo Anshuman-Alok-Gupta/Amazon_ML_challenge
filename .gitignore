@@ -16,3 +16,4 @@ HANDOFF*.md
 *.tgz
 *_submission.zip
 *.pdf
+colab/
