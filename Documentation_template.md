@@ -27,8 +27,9 @@ assignment step.
 **Results:** trained on the full training data, it reaches an **out-of-fold macro F0.5 of 0.9840**
 (US 0.9864, India 0.9804), with 98.25% candidate-pair recall, and 0.975 on the public
 leaderboard. Retrained at the test set's distractor density (18.7% of training S1 entities hidden,
-see Section 5), it scores **0.9836 out of fold on the harder frame and 0.976 on the public
-leaderboard**. Everything runs on CPU: 8 vCPU / 30 GB, EC2 m7i.2xlarge.
+see Section 5), it scores 0.9836 out of fold on the harder frame and 0.976 on the public
+leaderboard. With the cross-encoder applied to more pairs, the final submission scores **0.9838 out
+of fold and 0.977 on the public leaderboard**. Everything runs on CPU: 8 vCPU / 30 GB, EC2 m7i.2xlarge.
 
 ---
 
@@ -179,8 +180,9 @@ transformer cross-encoder) + constrained assignment
   - The 250k-token word-embedding matrix is frozen, to save memory and keep the pretrained
     multilingual vocabulary intact.
   - Held-out pairs: **AUC 0.9972**, log-loss 0.066, accuracy 97.6%.
-- On CPU it scores only the pairs whose level-0 probability lies in [0.05, 0.95]: 174k training
-  pairs and 1.21M test pairs, at about 270 pairs/s. The rest get a missing value, which the tree
+- On CPU it scores only the pairs whose level-0 probability lies in [0.02, 0.98]: 362k training
+  pairs and 2.17M test pairs, at about 300 pairs/s. (The first cross-encoder submission used
+  [0.05, 0.95]; widening the band added +0.0003 OOF and +0.001 on the leaderboard.) The rest get a missing value, which the tree
   models handle natively.
 
 **Stack (`src/stack.py`), all levels on the same 4 GroupKFold folds (by S1 entity):**
@@ -254,7 +256,8 @@ decoding with floor 0.45.
   | Normalisation round | 0.9779 | 0.964 |
   | Stack without cross-encoder | 0.9815 | 0.967 |
   | Stack with cross-encoder | 0.9840 | 0.975 |
-  | **Same stack, trained at test distractor density (final)** | **0.9836** | **0.976** |
+  | Same stack, trained at test distractor density | 0.9836 | 0.976 |
+  | **Same, cross-encoder band widened to [0.02, 0.98] (final)** | **0.9838** | **0.977** |
 
   - The gap between OOF and leaderboard stayed roughly constant (1.4–1.6 points) while both
     rose, until the cross-encoder narrowed it to 0.9. A constant gap points to a systematic
@@ -271,12 +274,12 @@ decoding with floor 0.45.
 
   | Test country | S1 entities | S1 with ≥ 1 match | Avg matches per S1 |
   |---|---|---|---|
-  | France | 259,452 | 94.7% | 3.36 |
+  | France | 259,452 | 94.6% | 3.36 |
   | India | 809,986 | 94.0% | 3.30 |
-  | US | 663,106 | 94.3% | 3.38 |
+  | US | 663,106 | 94.2% | 3.38 |
 
-  Overall, 1,632,486 of the 1,732,544 test S1 entities (94.2%) have at least one match, and there
-  are 5,788,266 matched pairs (final submission). In training, 94.4% of S1 entities have at least one true link.
+  Overall, 1,631,393 of the 1,732,544 test S1 entities (94.2%) have at least one match, and there
+  are 5,782,616 matched pairs (final submission). In training, 94.4% of S1 entities have at least one true link.
 - **Error analysis** (level-0 model, OOF errors for 20,000 S1 entities; about 93% of wrong pairs
   are false negatives, the intended trade-off for F0.5):
   - **Common false positives (wrong merges):** near-duplicate distractors. These have the same or
@@ -299,7 +302,8 @@ decoding with floor 0.45.
 
 ## 6. Conclusion
 A learned blocking stage plus a stacked matcher gives an out-of-fold macro F0.5 of 0.9840 and a
-public leaderboard score of 0.975, raised to 0.976 by training at the test set's distractor density. Everything runs on CPU, and the only external artefact is a
+public leaderboard score of 0.975, raised to 0.976 by training at the test set's distractor density and to 0.977 by applying the
+cross-encoder to more pairs. Everything runs on CPU, and the only external artefact is a
 small MIT-licensed pretrained encoder. The largest single gain came from the transformer
 cross-encoder (+0.004 OOF, +0.008 on the leaderboard). The next largest came from relational
 features that judge each candidate against the S1's other candidates, and from a stage-1
@@ -313,7 +317,8 @@ The remaining losses, in order of size:
    become unmatched distractors, as on test. h is measured from the row counts, the same for
    every country. The hidden entities are drawn outside samples A, B and C, so the stage-1 model
    and the cross-encoder are reused unchanged. On this harder frame the stack scores 0.9836 OOF
-   (US 0.9859, India 0.9800) and 0.976 on the leaderboard.
+   (US 0.9859, India 0.9800) and 0.976 on the leaderboard; with the wider cross-encoder band,
+   0.9838 (US 0.9862, India 0.9804) and 0.977.
 2. Records with a missing address that are scored below the cut-off.
 3. Native-script and trade-name pairs lost in blocking; the candidate set caps F0.5 at 0.9944.
 4. A cross-encoder limited by CPU: trained on 300k pairs and applied only to uncertain pairs.
@@ -358,7 +363,7 @@ Top level-0 features by gain: `stage1`, `addr_tset`, `t_gap_best`, `comb_cos`, `
 `t_is_best`, `first_num_equal`.
 
 Validator (`utils/validate_submission.py`, run with `--check-ids`): **PASS**. It found every
-one of the 1,732,544 S1 entities in both files: `matching_results.tsv` has 1,632,486 non-empty
+one of the 1,732,544 S1 entities in both files: `matching_results.tsv` has 1,631,393 non-empty
 rows and `candidate_pairs.tsv` has 1,732,503 non-empty rows (final submission).
 
 ### C. Rejected Experiment: Graph Neural Network
@@ -379,7 +384,7 @@ the repository's `gnn` branch.
   every edge is visible, and only training-fold labels enter the loss.
 - **Result.** Out of fold on the graph frame it scored 0.9828 against 0.9792 for the level-2
   stack on the same S1 (+0.0036, 95% CI [+0.0034, +0.0038]; US +0.0039, India +0.0026), with
-  matching train and validation loss. On the public leaderboard it scored **0.970 against 0.976**.
+  matching train and validation loss. On the public leaderboard it scored **0.970 against 0.976** for the same stack without it.
 - **Likely causes.** The graph frame keeps all region-less records of a country but only 15% of
   its regions, so record-side competition, the signal the GNN relies on, is not distributed as
   on test. France (23% of test pairs) has no training data, and the learned correction can

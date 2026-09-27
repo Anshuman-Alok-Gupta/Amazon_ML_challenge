@@ -34,7 +34,8 @@ import normalize  # noqa: E402
 from blocking import (BlockText, TokenIndex, keep_top, make_blocks, make_target, pool,  # noqa: E402
                       pool_features, stage1_features, target_best)
 from config import (DEFAULT_ARTIFACT_DIR, DEFAULT_CACHE_DIR, DEFAULT_DATA_DIR,  # noqa: E402
-                    DEFAULT_OUTPUT_DIR, SEED, BlockingConfig, ModelConfig, PostConfig, TrainConfig)
+                    DEFAULT_OUTPUT_DIR, SEED, BlockingConfig, ModelConfig, PostConfig, StackConfig,
+                    TrainConfig)
 from features import build_features  # noqa: E402
 from io_utils import (CAND_HEADER, MATCH_HEADER, check_pairs, gt_dict, load_split,  # noqa: E402
                       read_ground_truth, read_source, write_pairs)  # noqa: E402
@@ -631,7 +632,8 @@ def cmd_stack(args):
     ids = pd.read_parquet(fdir / "s1.parquet")["s1_id"].tolist()
     gt = gt_dict(read_ground_truth(Path(args.data_dir) / "train" / "train_ground_truth.tsv"), ids)
     paths = cache_paths(args, "train")
-    stack.train(fdir, [paths["s2"], paths["s3"]], gt, Path(args.artifact_dir), tune_decoder)
+    scfg = StackConfig(use_cat=True) if args.use_cat else None
+    stack.train(fdir, [paths["s2"], paths["s3"]], gt, Path(args.artifact_dir), tune_decoder, scfg)
     if args.baseline:
         per = pd.read_parquet(Path(args.artifact_dir) / "oof_entity_f05_stack.parquet")
         compare_to_baseline(per, Path(args.baseline))
@@ -748,6 +750,8 @@ def main(argv=None):
                     help="dev mode: train on a seeded fraction of regions (e.g. 0.15)")
     ap.add_argument("--hide-s1", default="0",
                     help="train: hide this fraction of train S1 ('auto' = match test's targets per S1)")
+    ap.add_argument("--use-cat", action="store_true",
+                    help="stack: add CatBoost as a level-1 learner (slow on CPU)")
     ap.add_argument("--min-free-gb", type=float, default=1.5,
                     help="abort if available RAM falls below this (0 disables)")
     args = ap.parse_args(argv)
