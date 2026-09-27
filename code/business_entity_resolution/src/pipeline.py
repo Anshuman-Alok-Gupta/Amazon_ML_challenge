@@ -350,6 +350,23 @@ def hide_fraction(args) -> float:
     return h
 
 
+def sample_ids(args, data: SplitData):
+    """Seeded S1 samples A (stage 1), B (matcher), C (cross-encoder) and the hidden set.
+
+    Hidden S1 come from outside A/B/C, so the samples (and the trained CE) do not depend on it.
+    """
+    tcfg = TrainConfig()
+    n_b = args.sample or tcfg.n_s1_sample
+    n_c = tcfg.n_ce_sample if args.ce_sample is None else args.ce_sample
+    n_a = min(tcfg.n_stage1_sample, max(len(data.s1_ids) - n_b - n_c, len(data.s1_ids) // 4))
+    perm = np.random.default_rng(SEED).permutation(data.s1_ids)
+    ids_a, ids_b = np.sort(perm[:n_a]), np.sort(perm[n_a:n_a + n_b])
+    ids_c = np.sort(perm[n_a + n_b:n_a + n_b + n_c])
+    start = n_a + n_b + n_c
+    hidden = perm[start:start + int(round(hide_fraction(args) * len(perm)))]
+    return ids_a, ids_b, ids_c, hidden
+
+
 def train_frame(args):
     """Stage 1 on sample A; candidates, features and labels for a disjoint sample B.
 
@@ -358,18 +375,10 @@ def train_frame(args):
     """
     bcfg, tcfg = BlockingConfig(), TrainConfig()
     data = SplitData(args.data_dir, "train", args.cache_dir, subset=args.subset)
-    n_b = args.sample or tcfg.n_s1_sample
-    n_c = tcfg.n_ce_sample if args.ce_sample is None else args.ce_sample
-    n_a = min(tcfg.n_stage1_sample, max(len(data.s1_ids) - n_b - n_c, len(data.s1_ids) // 4))
-    perm = np.random.default_rng(SEED).permutation(data.s1_ids)
-    ids_a, ids_b = np.sort(perm[:n_a]), np.sort(perm[n_a:n_a + n_b])
-    ids_c = np.sort(perm[n_a + n_b:n_a + n_b + n_c])
-    h = hide_fraction(args)
-    if h > 0:
-        # hidden S1 come from outside A/B/C, so the samples (and the trained CE) are unchanged
-        start = n_a + n_b + n_c
-        hidden = perm[start:start + int(round(h * len(perm)))]
-        n_s1 = len(perm)
+    ids_a, ids_b, ids_c, hidden = sample_ids(args, data)
+    if len(hidden):
+        n_s1 = len(data.s1_ids)
+        h = len(hidden) / n_s1
         data.hide(hidden)
         n_tgt = sum(pq.ParquetFile(v).metadata.num_rows for k, v in data.paths.items() if k != "s1")
         print(f"  hide-s1: h={h:.4f}, hid {len(hidden):,} of {n_s1:,} train S1 -> "
@@ -594,6 +603,9 @@ def cmd_ce_train(args):
     (Path(args.artifact_dir) / "ce_report.json").write_text(json.dumps({**rep, "model": cfg.model}, indent=2))
 
 
+SOURCE_SPLIT = {"graph": "train"}  # frame name -> split whose records it holds
+
+
 def cmd_ce_score(args):
     """Cross-encoder logit for the train (sample B) and test frames -> frames/<split>/ce.parquet.
 
@@ -603,7 +615,7 @@ def cmd_ce_score(args):
     """
     import cross_encoder as ce
     cfg = ce_config(args)
-    for split in ("train", "test"):
+    for split in args.ce_splits.split(","):
         fdir = frame_dir(args, split)
         pairs = pd.read_parquet(fdir / "pairs.parquet", columns=["s1_id", "cand_id", "prob"])
         out = np.full(len(pairs), np.nan, np.float32)
@@ -616,7 +628,8 @@ def cmd_ce_score(args):
               f"{(~np.isnan(out)).sum():,} already scored)", flush=True)
         sub = pairs[m]
         with Timer(f"cross-encoder score {split}"):
-            texts = ce.load_texts(cache_paths(args, split).values(), np.r_[sub["s1_id"], sub["cand_id"]])
+            texts = ce.load_texts(cache_paths(args, SOURCE_SPLIT.get(split, split)).values(),
+                                  np.r_[sub["s1_id"], sub["cand_id"]])
             a, b = ce.pair_texts(sub, texts)
             del texts
             out[m] = ce.score(Path(args.artifact_dir) / "ce_model", a, b, cfg)
@@ -631,7 +644,10 @@ def cmd_stack(args):
     ids = pd.read_parquet(fdir / "s1.parquet")["s1_id"].tolist()
     gt = gt_dict(read_ground_truth(Path(args.data_dir) / "train" / "train_ground_truth.tsv"), ids)
     paths = cache_paths(args, "train")
-    stack.train(fdir, [paths["s2"], paths["s3"]], gt, Path(args.artifact_dir), tune_decoder)
+    exclude = None
+    if args.exclude_frame:
+        exclude = set(pd.read_parquet(frame_dir(args, args.exclude_frame) / "s1.parquet")["s1_id"])
+    stack.train(fdir, [paths["s2"], paths["s3"]], gt, Path(args.artifact_dir), tune_decoder, exclude_s1=exclude)
     if args.baseline:
         per = pd.read_parquet(Path(args.artifact_dir) / "oof_entity_f05_stack.parquet")
         compare_to_baseline(per, Path(args.baseline))
@@ -656,6 +672,78 @@ def cmd_stack_predict(args):
         entities="size", with_match=lambda v: (v > 0).mean(), avg_matches="mean")
     print(summary.to_string())
     print(f"stack level {spec['level']} ({spec['decoder']} @ {spec['threshold']}): candidates {len(scored):,}, "
+          f"matches {len(matches):,}; wrote {out}")
+
+
+def cmd_graph_frame(args):
+    """Frame over ALL (non-hidden) train S1 of a seeded fraction of regions -> frames/graph.
+
+    Unlike the sampled frame B, every S1 that competes for a target is present, with the same
+    hidden share as training, so the candidate graph has test's structure (targets claimed by
+    several S1, orphan distractors). The GNN (gnn.py) is trained on it.
+    """
+    bcfg = BlockingConfig()
+    full = SplitData(args.data_dir, "train", args.cache_dir)
+    _, ids_b, ids_c, hidden = sample_ids(args, full)
+    gt_all = full.gt
+    del full
+    data = SplitData(args.data_dir, "train", args.cache_dir, subset=args.graph_subset)
+    n_s1 = len(data.s1_ids)
+    data.hide(hidden)
+    print(f"  graph frame: {len(data.s1_ids):,} S1 ({n_s1 - len(data.s1_ids):,} hidden); "
+          f"{np.isin(data.s1_ids, ids_b).sum():,} also in sample B, {np.isin(data.s1_ids, ids_c).sum():,} in C",
+          flush=True)
+    gt = gt_dict(gt_all, data.s1_ids)
+    booster, meta = mdl.load(args.artifact_dir)
+    stage1 = lgb.Booster(model_file=str(Path(args.artifact_dir) / "stage1.txt"))
+    fdir = frame_dir(args, "graph")
+    fdir.mkdir(parents=True, exist_ok=True)
+    writer = FrameWriter(fdir)
+
+    def write(p, X):  # prob (level 0) is only used to choose the cross-encoder band
+        prob = booster.predict(X[meta["features"]]).astype(np.float32)
+        writer.write(p.assign(y=labels(p, gt), prob=prob), X)
+
+    with Timer("graph frame"):
+        generate(data, bcfg, None, stage1, write)
+    writer.close()
+    pd.DataFrame({"s1_id": data.s1_ids, "country": data.s1_country}).to_parquet(fdir / "s1.parquet", index=False)
+    pairs = pd.read_parquet(fdir / "pairs.parquet", columns=["s1_id", "cand_id"])
+    rep = blocking_report(id_lists(pairs), gt, len(data.target_ids()), data.s1_ids)
+    print("  blocking (graph frame): " + ", ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
+                                                  for k, v in rep.items()))
+
+
+def cmd_gnn_train(args):
+    import gnn
+    fdir = frame_dir(args, "graph")
+    ids = pd.read_parquet(fdir / "s1.parquet")["s1_id"].tolist()
+    gt = gt_dict(read_ground_truth(Path(args.data_dir) / "train" / "train_ground_truth.tsv"), ids)
+    paths = cache_paths(args, "train")
+    from config import GNNConfig
+    cfg = GNNConfig() if args.gnn_epochs is None else GNNConfig(max_epochs=args.gnn_epochs)
+    gnn.train(fdir, [paths["s2"], paths["s3"]], gt, Path(args.artifact_dir), tune_decoder, cfg)
+
+
+def cmd_gnn_predict(args):
+    import gnn
+    fdir = frame_dir(args, "test")
+    paths = cache_paths(args, "test")
+    with Timer("gnn predict"):
+        scored, dec = gnn.predict(fdir, [paths["s2"], paths["s3"]], Path(args.artifact_dir), use_gnn=not args.no_gnn)
+    data = SplitData(args.data_dir, "test", args.cache_dir)
+    matches = select_with(scored, dec["threshold"], dec["exclusive"], dec["decoder"])
+    problems = check_pairs(matches, scored, data.s1_ids, data.target_ids())
+    if problems:
+        raise SystemExit("submission check failed:\n  " + "\n  ".join(problems[:20]))
+    out = Path(args.output_dir)
+    write_pairs(out / "matching_results.tsv", MATCH_HEADER, data.s1_ids, matches)
+    write_pairs(out / "candidate_pairs.tsv", CAND_HEADER, data.s1_ids, scored)
+    n_matched = matches.groupby("s1_id").size().reindex(data.s1_ids).fillna(0).to_numpy()
+    summary = pd.DataFrame({"country": data.s1_country, "n": n_matched}).groupby("country")["n"].agg(
+        entities="size", with_match=lambda v: (v > 0).mean(), avg_matches="mean")
+    print(summary.to_string())
+    print(f"{dec['name']} ({dec['decoder']} @ {dec['threshold']}): candidates {len(scored):,}, "
           f"matches {len(matches):,}; wrote {out}")
 
 
@@ -728,7 +816,8 @@ def start_memory_guard(min_free_gb: float):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["eda", "train", "validate", "predict", "all",
-                                        "ce-train", "ce-score", "stack", "stack-predict"])
+                                        "ce-train", "ce-score", "stack", "stack-predict",
+                                        "graph-frame", "gnn-train", "gnn-predict"])
     ap.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     ap.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     ap.add_argument("--artifact-dir", type=Path, default=DEFAULT_ARTIFACT_DIR)
@@ -748,6 +837,15 @@ def main(argv=None):
                     help="dev mode: train on a seeded fraction of regions (e.g. 0.15)")
     ap.add_argument("--hide-s1", default="0",
                     help="train: hide this fraction of train S1 ('auto' = match test's targets per S1)")
+    ap.add_argument("--ce-splits", default="train,test",
+                    help="ce-score: comma-separated frames to score (train, test, graph)")
+    ap.add_argument("--graph-subset", type=float, default=0.15,
+                    help="graph-frame: seeded fraction of train regions whose S1 are all kept")
+    ap.add_argument("--exclude-frame", default=None,
+                    help="stack: leave out the S1 of this frame (e.g. graph), so its scores are out-of-sample")
+    ap.add_argument("--gnn-epochs", type=int, default=None, help="gnn-train: maximum epochs per fold")
+    ap.add_argument("--no-gnn", action="store_true",
+                    help="gnn-predict: level-2 probabilities with the decoder tuned on the graph frame")
     ap.add_argument("--min-free-gb", type=float, default=1.5,
                     help="abort if available RAM falls below this (0 disables)")
     args = ap.parse_args(argv)
@@ -755,7 +853,8 @@ def main(argv=None):
         start_memory_guard(args.min_free_gb)
     cmds = {"eda": [cmd_eda], "train": [cmd_train], "validate": [cmd_validate],
             "predict": [cmd_predict], "all": [cmd_train, cmd_predict], "ce-train": [cmd_ce_train],
-            "ce-score": [cmd_ce_score], "stack": [cmd_stack], "stack-predict": [cmd_stack_predict]}
+            "ce-score": [cmd_ce_score], "stack": [cmd_stack], "stack-predict": [cmd_stack_predict],
+            "graph-frame": [cmd_graph_frame], "gnn-train": [cmd_gnn_train], "gnn-predict": [cmd_gnn_predict]}
     for fn in cmds[args.command]:
         fn(args)
 

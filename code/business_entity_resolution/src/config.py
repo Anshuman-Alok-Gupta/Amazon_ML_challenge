@@ -109,3 +109,16 @@ class StackConfig:
     })
     num_boost_round: int = 3000
     early_stopping_rounds: int = 100
+
+
+@dataclass
+class GNNConfig:
+    dim: int = 32                  # edge state size
+    hidden: int = 64               # MLP width
+    layers: int = 3                # message-passing rounds
+    lr: float = 3e-3
+    weight_decay: float = 1e-5
+    max_epochs: int = 25
+    patience: int = 3              # epochs without a validation-loss gain before stopping
+    batch_edges: int = 400_000     # whole connected components are grouped up to about this size
+    n_folds: int = 4               # fold models are averaged at test time (no refit)

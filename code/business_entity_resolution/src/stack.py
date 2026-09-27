@@ -254,8 +254,13 @@ def _compare(a: dict, b: dict, country: np.ndarray) -> float:
     return lo if worst >= 0 else -1.0
 
 
-def train(fdir: Path, target_paths, gt: dict, art: Path, tune_decoder, scfg: StackConfig | None = None):
-    """Fit all levels on the training frame, print the ablation, save models + stack.json."""
+def train(fdir: Path, target_paths, gt: dict, art: Path, tune_decoder, scfg: StackConfig | None = None,
+          exclude_s1: set | None = None):
+    """Fit all levels on the training frame, print the ablation, save models + stack.json.
+
+    exclude_s1: S1 entities left out of the frame (e.g. those of the GNN's graph frame, so the
+    stack's scores on it are out-of-sample). Their folds are kept.
+    """
     scfg, mcfg, pcfg = scfg or StackConfig(), ModelConfig(), PostConfig()
     gpu = has_gpu()
     art = Path(art)
@@ -268,6 +273,13 @@ def train(fdir: Path, target_paths, gt: dict, art: Path, tune_decoder, scfg: Sta
     has_ce = (fdir / "ce.parquet").exists()
     if has_ce:
         X["ce_logit"] = pd.read_parquet(fdir / "ce.parquet")["ce_logit"].to_numpy(np.float32)
+    if exclude_s1:
+        keep = ~pairs["s1_id"].isin(exclude_s1).to_numpy()
+        pairs, X = pairs[keep].reset_index(drop=True), X[keep].reset_index(drop=True)
+        s1 = s1[~s1["s1_id"].isin(exclude_s1)]
+        ids, country = s1["s1_id"].tolist(), s1["country"].to_numpy(object)
+        y, folds = pairs["y"].to_numpy(np.int8), pairs["fold"].to_numpy()
+        print(f"stack: left out {int((~keep).sum()):,} pairs of excluded S1 ({len(ids):,} S1 remain)")
     print(f"stack: {len(pairs):,} pairs, {X.shape[1]} level-0 features (cross-encoder: {has_ce}), "
           f"gpu={gpu}", flush=True)
 
@@ -377,6 +389,56 @@ def country_ranges(country: np.ndarray) -> list[tuple[int, int]]:
     return list(zip(cuts[:-1].tolist(), cuts[1:].tolist()))
 
 
+def load_models(art: Path, spec: dict) -> dict:
+    """Saved level-1 / 2 / 3 models of a stack (the ones its level and l1 list use)."""
+    art = Path(art)
+    m = {"lgb": lgb.Booster(model_file=str(art / "stack_l1_lgb.txt")) if spec["has_ce"] else None}
+    if "xgb" in spec["l1"]:
+        m["xgb"] = _xgb().Booster()
+        m["xgb"].load_model(str(art / "stack_l1_xgb.json"))
+    if "cat" in spec["l1"]:
+        from catboost import CatBoostClassifier
+        m["cat"] = CatBoostClassifier().load_model(str(art / "stack_l1_cat.cbm"))
+    if (art / "stack_l2.txt").exists():
+        m["l2"] = lgb.Booster(model_file=str(art / "stack_l2.txt"))
+    if spec["level"] == "l3":
+        m["l3"] = lgb.Booster(model_file=str(art / "stack_l3.txt"))
+    return m
+
+
+def read_level0(fdir: Path, a: int, b: int, spec: dict) -> pd.DataFrame:
+    """Level-0 features (+ cross-encoder logit) of rows [a, b) of a frame."""
+    X = read_rows(fdir / "X.parquet", a, b)
+    if spec["has_ce"]:
+        X["ce_logit"] = read_rows(fdir / "ce.parquet", a, b)["ce_logit"].to_numpy(np.float32)
+    return X[spec["features"]]
+
+
+def level1(P: pd.DataFrame, X: pd.DataFrame, spec: dict, models: dict) -> tuple[dict, np.ndarray]:
+    """Level-1 logits by learner, and their column stack in spec order."""
+    L = {"lgb": logit(models["lgb"].predict(X)) if models["lgb"] is not None else logit(P["prob"].to_numpy())}
+    if "xgb" in spec["l1"]:
+        L["xgb"] = logit(xgb_predict(models["xgb"], X))
+    if "cat" in spec["l1"]:
+        L["cat"] = logit(models["cat"].predict_proba(X)[:, 1])
+    return L, np.column_stack([L[k] for k in spec["l1"]])
+
+
+def level2(P: pd.DataFrame, X: pd.DataFrame, Lm: np.ndarray, spec: dict, models: dict, rec: Records):
+    """Level-2 input Z (level 0 + level-1 logits + relational features) and its probability."""
+    R = relational(P, sigmoid(Lm.mean(axis=1)), X["first_num_equal"].to_numpy(np.float32), rec)
+    Z = pd.concat([X, pd.DataFrame(Lm, columns=[f"l1_{k}" for k in spec["l1"]]), R], axis=1)
+    return Z, models["l2"].predict(Z[spec["l2_features"]])
+
+
+def check_ranges(pairs: pd.DataFrame) -> list[tuple[int, int]]:
+    ranges = country_ranges(pairs["country"].to_numpy(object))
+    rid = np.repeat(np.arange(len(ranges)), [b - a for a, b in ranges])
+    if pd.Series(rid).groupby(pairs["s1_id"].to_numpy(object)).nunique().max() > 1:
+        raise ValueError("an S1 entity's candidates span several country ranges")
+    return ranges
+
+
 def predict(fdir: Path, target_paths, art: Path) -> tuple[pd.DataFrame, dict]:
     """Probabilities of the chosen stack level for every pair of a (test) frame."""
     art = Path(art)
@@ -385,48 +447,23 @@ def predict(fdir: Path, target_paths, art: Path) -> tuple[pd.DataFrame, dict]:
     pairs = pd.read_parquet(fdir / "pairs.parquet", columns=["s1_id", "cand_id", "source", "country", "prob"])
     if level == "l0":
         return pairs[["s1_id", "cand_id", "prob"]], spec
-    lgb_m = lgb.Booster(model_file=str(art / "stack_l1_lgb.txt")) if spec["has_ce"] else None
-    xgb_m = None
-    if "xgb" in spec["l1"]:
-        xgb_m = _xgb().Booster()
-        xgb_m.load_model(str(art / "stack_l1_xgb.json"))
-    cat_m = None
-    if "cat" in spec["l1"]:
-        from catboost import CatBoostClassifier
-        cat_m = CatBoostClassifier().load_model(str(art / "stack_l1_cat.cbm"))
-    l2 = lgb.Booster(model_file=str(art / "stack_l2.txt")) if level in ("l2", "l3") else None
-    l3 = lgb.Booster(model_file=str(art / "stack_l3.txt")) if level == "l3" else None
-
-    ranges = country_ranges(pairs["country"].to_numpy(object))
-    rid = np.repeat(np.arange(len(ranges)), [b - a for a, b in ranges])
-    if pd.Series(rid).groupby(pairs["s1_id"].to_numpy(object)).nunique().max() > 1:
-        raise ValueError("an S1 entity's candidates span several country ranges")
+    models = load_models(art, spec)
     out = []
-    for a, b in ranges:
+    for a, b in check_ranges(pairs):
         t = time.perf_counter()
         P = pairs.iloc[a:b].reset_index(drop=True)
-        X = read_rows(fdir / "X.parquet", a, b)
-        if spec["has_ce"]:
-            X["ce_logit"] = read_rows(fdir / "ce.parquet", a, b)["ce_logit"].to_numpy(np.float32)
-        X = X[spec["features"]]
-        L = {"lgb": logit(lgb_m.predict(X)) if lgb_m is not None else logit(P["prob"].to_numpy())}
-        if xgb_m is not None:
-            L["xgb"] = logit(xgb_predict(xgb_m, X))
-        if cat_m is not None:
-            L["cat"] = logit(cat_m.predict_proba(X)[:, 1])
-        Lm = np.column_stack([L[k] for k in spec["l1"]])
+        X = read_level0(fdir, a, b, spec)
+        L, Lm = level1(P, X, spec, models)
         if level == "l1_lgb":
             prob = sigmoid(L["lgb"])
         elif level == "l1_mean":
             prob = sigmoid(Lm.mean(axis=1))
         else:
             rec = Records(target_paths, P["cand_id"])
-            R = relational(P, sigmoid(Lm.mean(axis=1)), X["first_num_equal"].to_numpy(np.float32), rec)
-            Z = pd.concat([X, pd.DataFrame(Lm, columns=[f"l1_{k}" for k in spec["l1"]]), R], axis=1)
-            prob = l2.predict(Z[spec["l2_features"]])
+            Z, prob = level2(P, X, Lm, spec, models, rec)
             if level == "l3":
-                prob = l3.predict(level3_input(Z, prob, P, X, rec)[spec["l3_features"]])
-            del rec, R, Z
+                prob = models["l3"].predict(level3_input(Z, prob, P, X, rec)[spec["l3_features"]])
+            del rec, Z
         out.append(P[["s1_id", "cand_id"]].assign(prob=np.asarray(prob, np.float32)))
         print(f"  [{P['country'].iat[0]}] {len(P):,} pairs scored ({level}) in {time.perf_counter() - t:.0f}s",
               flush=True)
