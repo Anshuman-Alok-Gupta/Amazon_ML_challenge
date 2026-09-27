@@ -106,6 +106,7 @@ class StackConfig:
     })
     cat_params: dict = field(default_factory=lambda: {
         "loss_function": "Logloss", "learning_rate": 0.1, "depth": 8, "random_seed": SEED,
+        "allow_writing_files": False,  # no catboost_info/ training logs in the working directory
     })
     num_boost_round: int = 3000
     early_stopping_rounds: int = 100
