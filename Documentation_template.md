@@ -20,7 +20,8 @@ an assignment step tuned for the precision-heavy metric.
 - **Matcher.** A two-level stack:
   - Level 1: LightGBM and XGBoost on 72 similarity and competition features, plus the score of
     a fine-tuned multilingual transformer cross-encoder (`intfloat/multilingual-e5-small`, MIT,
-    118M parameters) that reads the raw text of both records.
+    118M parameters) that reads the raw text of both records. It is trained on a GPU and scores
+    every candidate pair.
   - Level 2: a LightGBM meta-model that also looks at each S1's other candidates.
 - **Assignment.** Each Source 2/3 record is given to at most one Source 1 entity, and a decoder
   tuned directly for macro F0.5 decides how many candidates each S1 keeps.
@@ -33,12 +34,14 @@ the row counts, so the model trains against the same density of distractors (Sec
 
 | | Out-of-fold macro F0.5 | Public leaderboard |
 |---|---|---|
-| Stack with cross-encoder, standard training data | 0.9840 (US 0.9864, India 0.9804) | 0.975 |
-| **Same stack at test distractor density (final)** | **0.9838 (US 0.9862, India 0.9804)** | **0.977** |
+| Stack with CPU cross-encoder, standard training data | 0.9840 (US 0.9864, India 0.9804) | 0.975 |
+| Same stack at test distractor density | 0.9838 (US 0.9862, India 0.9804) | 0.977 |
+| **Cross-encoder retrained on GPU, every pair scored (final)** | **0.9852 (US 0.9872, India 0.9821)** | **0.979** |
 
-The two OOF scores are measured on different training frames. The density-matched one is
+The first OOF score is measured on a different training frame. The density-matched frame is
 harder, so its OOF is slightly lower even though the model scores higher on the leaderboard.
-Candidate-pair recall is 98.26%. Everything runs on CPU (EC2 m7i.2xlarge: 8 vCPU, 30 GB RAM).
+Candidate-pair recall is 98.26%. Everything runs on CPU (EC2 m7i.2xlarge: 8 vCPU, 30 GB RAM)
+except the cross-encoder, which was trained and scored on a single GPU (Colab A100).
 
 ---
 
@@ -197,17 +200,21 @@ transformer cross-encoder) + constrained assignment
 - It sees native scripts, French and house numbers directly, which the hand-made similarity
   scores can only approximate.
 - **Training:**
-  - Data: 300k candidate pairs from a third training sample C (150k S1). C is disjoint from the
-    stage-1 and matcher samples, so its scores on the matcher's training data are out-of-sample.
-  - Settings: 1 epoch, AdamW (learning rate 5e-5 with linear warm-up), batch size 64, bfloat16
-    on the CPU's AMX units.
+  - Data: all 1.16M candidate pairs of a third training sample C (150k S1; 2% held out). C is
+    disjoint from the stage-1 and matcher samples, so its scores on the matcher's training data
+    are out-of-sample.
+  - Settings: 1 epoch, AdamW (learning rate 5e-5 with linear warm-up), batch size 64, mixed
+    precision (bfloat16 on the A100; float16 with loss scaling on older GPUs).
   - The 250k-token word-embedding matrix is frozen, to save memory and keep the pretrained
     multilingual vocabulary intact.
-  - On held-out pairs: **AUC 0.9972**, log-loss 0.066, accuracy 97.6%.
-- **Scoring:** on CPU it scores only pairs whose level-0 probability is between 0.02 and 0.98:
-  362k training pairs and 2.17M test pairs, at about 300 pairs per second. Other pairs get a
-  missing value, which the tree models handle natively. Our first cross-encoder submission used
-  0.05–0.95; widening the band added +0.0003 OOF and +0.001 on the leaderboard.
+  - On held-out pairs: **AUC 0.9986**, log-loss 0.046, accuracy 98.3%.
+- **Scoring:** every candidate pair, 3.09M training and 15.8M test pairs, at about 8,300 pairs
+  per second on the A100.
+- **Earlier CPU version:** before we had a GPU, the cross-encoder was trained on 300k pairs
+  (AUC 0.9972) and scored only pairs with level-0 probability between 0.02 and 0.98 (14% of
+  test pairs); the rest were left missing. That band skipped exactly the confident
+  near-duplicate distractors. Training on all of sample C and scoring every pair added +0.0013
+  OOF and +0.002 on the leaderboard (0.977 → 0.979).
 
 **Stack (`src/stack.py`).** All levels use the same 4 folds, grouped by S1 entity (GroupKFold).
 - **Level 1:** LightGBM (MIT) and XGBoost (Apache-2.0) on the level-0 features plus the
@@ -245,7 +252,7 @@ with the higher macro F0.5 is used:
 
 Each decoder has exactly one tuned number, found by grid search on macro F0.5 (singletons
 included). We take the middle of the best plateau, which is more robust than the single best
-point. The final model uses expected-F0.5 decoding with a floor of 0.6.
+point. The final model uses expected-F0.5 decoding with a floor of 0.35.
 
 **Guarding against overfitting:**
 - Every change and every stacking level is accepted only by a paired bootstrap of per-entity
@@ -263,21 +270,22 @@ point. The final model uses expected-F0.5 decoding with a floor of 0.6.
 - **F_0.5 Score (macro), out of fold:** 4-fold GroupKFold over a 400k-S1 training sample, with
   exclusive assignment. What each component added:
 
-  | Model | OOF F0.5, standard data | Gain (95% CI) | OOF F0.5, test density (final) |
-  |---|---|---|---|
-  | LightGBM with cosine-only re-ranker (earlier round) | 0.9779 | – | – |
-  | + learned stage-1 re-ranker | 0.9792 | +0.0012 [+0.0011, +0.0014] | 0.9782 |
-  | + cross-encoder score (level-1 LightGBM) | 0.9832 | +0.0040 [+0.0038, +0.0042] | 0.9829 |
-  | + XGBoost (level-1 mean) | 0.9833 | +0.0001 [+0.0000, +0.0001] | 0.9830 |
-  | + level-2 relational meta-model | **0.9840** | +0.0008 [+0.0007, +0.0009] | **0.9838** |
+  | Model | Standard data, CPU cross-encoder | Gain (95% CI) | Test density, CPU cross-encoder | Test density, GPU cross-encoder (final) | Gain (95% CI) |
+  |---|---|---|---|---|---|
+  | LightGBM with cosine-only re-ranker (earlier round) | 0.9779 | – | – | – | – |
+  | + learned stage-1 re-ranker | 0.9792 | +0.0012 [+0.0011, +0.0014] | 0.9782 | 0.9782 | – |
+  | + cross-encoder score (level-1 LightGBM) | 0.9832 | +0.0040 [+0.0038, +0.0042] | 0.9829 | 0.9846 | +0.0064 [+0.0062, +0.0066] |
+  | + XGBoost (level-1 mean) | 0.9833 | +0.0001 [+0.0000, +0.0001] | 0.9830 | 0.9847 | +0.0001 [+0.0000, +0.0001] |
+  | + level-2 relational meta-model | 0.9840 | +0.0008 [+0.0007, +0.0009] | 0.9838 | **0.9852** | +0.0005 [+0.0004, +0.0006] |
 
-  The final model by country:
+  The final model against the CPU cross-encoder version on the same frame: +0.0013, 95% CI
+  [+0.0012, +0.0014]; India +0.0017, US +0.0011. By country:
 
   | Scope | S1 entities | OOF macro F0.5 |
   |---|---|---|
-  | **Overall** | 400,000 | **0.9838** |
-  | US | 239,845 | 0.9862 |
-  | India | 160,155 | 0.9804 |
+  | **Overall** | 400,000 | **0.9852** |
+  | US | 239,845 | 0.9872 |
+  | India | 160,155 | 0.9821 |
 
   Without the cross-encoder, the stack scores 0.9815 on the standard data (US 0.9847, India
   0.9768).
@@ -290,7 +298,8 @@ point. The final model uses expected-F0.5 decoding with a floor of 0.6.
   | Stack without cross-encoder | 0.9815 | 0.967 |
   | Stack with cross-encoder | 0.9840 | 0.975 |
   | Same stack, trained at test density | 0.9836 | 0.976 |
-  | **Same, cross-encoder band widened to 0.02–0.98 (final)** | **0.9838** | **0.977** |
+  | Same, cross-encoder band widened to 0.02–0.98 | 0.9838 | 0.977 |
+  | **Cross-encoder retrained on GPU, every pair scored (final)** | **0.9852** | **0.979** |
 
   - While both scores rose, the gap between OOF and the leaderboard stayed roughly constant at
     1.4–1.6 points, until the cross-encoder narrowed it to 0.9. A constant gap points to a
@@ -300,7 +309,9 @@ point. The final model uses expected-F0.5 decoding with a floor of 0.6.
     probability 0.2–0.9 is 30% on India test against 19% in training, 19% on US test against
     16%, and 32% on France.
   - The cross-encoder, which compares the raw text of both records, copes best with the extra
-    near-duplicates. It gained more on the leaderboard (+0.008) than out of fold (+0.0025).
+    near-duplicates. Every cross-encoder improvement gained more on the leaderboard than out of
+    fold: +0.008 vs +0.0025 when it was added, and +0.002 vs +0.0013 when it was retrained on a
+    GPU and applied to every pair.
   - Training at test density then gained on the leaderboard even though its OOF, now measured
     on a harder frame, went down slightly.
 - **Unseen country (France):** there are no labels, but France's match rate and number of
@@ -308,12 +319,13 @@ point. The final model uses expected-F0.5 decoding with a floor of 0.6.
 
   | Test country | S1 entities | S1 with ≥ 1 match | Avg matches per S1 |
   |---|---|---|---|
-  | France | 259,452 | 94.6% | 3.36 |
+  | France | 259,452 | 94.5% | 3.28 |
   | India | 809,986 | 94.0% | 3.30 |
-  | US | 663,106 | 94.2% | 3.38 |
+  | US | 663,106 | 94.2% | 3.37 |
 
-  Overall, 1,631,393 of the 1,732,544 test S1 entities (94.2%) have at least one match, with
-  5,782,616 matched pairs in total. In the training data, 94.4% of S1 entities have at least
+  Overall, 1,631,326 of the 1,732,544 test S1 entities (94.2%) have at least one match, with
+  5,756,387 matched pairs in total. With the GPU cross-encoder, France's matches per S1 fell the
+  most (3.36 → 3.28), consistent with more French near-duplicates being rejected. In the training data, 94.4% of S1 entities have at least
   one true link.
 - **Error analysis** (level-0 model, OOF errors for 20,000 S1 entities). About 93% of wrong
   pairs are missed matches, which is the intended trade-off under F0.5.
@@ -338,9 +350,10 @@ point. The final model uses expected-F0.5 decoding with a floor of 0.6.
 ## 6. Conclusion
 A learned blocking stage and a stacked matcher reach an out-of-fold macro F0.5 of 0.9840 and a
 public leaderboard score of 0.975. Training at the test set's distractor density raised the
-leaderboard score to 0.976, and scoring more pairs with the cross-encoder raised it to 0.977.
-The only external artefact is a small MIT-licensed pretrained encoder, and everything runs on
-CPU.
+leaderboard score to 0.976, scoring more pairs with the cross-encoder raised it to 0.977, and
+retraining the cross-encoder on a GPU on all of sample C and scoring every pair raised it to
+0.979 (OOF 0.9852). The only external artefact is a small MIT-licensed pretrained encoder;
+everything except the cross-encoder runs on CPU.
 
 The largest single gain came from the transformer cross-encoder (+0.004 OOF, +0.008 on the
 leaderboard). Other gains came from the stage-1 re-ranker's cheap name and house-number
@@ -354,8 +367,8 @@ The remaining losses, in order of size:
 2. Records with a missing address that are scored below the cut-off.
 3. Native-script and trade-name pairs lost in blocking; the candidate set limits F0.5 to
    0.9944.
-4. A cross-encoder limited by CPU time: trained on 300k pairs and applied only to uncertain
-   pairs. A GPU would allow training on all 1.15M sample-C pairs and scoring every candidate.
+4. Cross-encoder capacity: with more GPU time, a larger multilingual encoder, more epochs, or
+   several cross-encoders as separate features could be tried.
 
 ---
 
@@ -388,7 +401,8 @@ scoring and the stack on the same machine; the cross-encoder was not retrained.
 | Level-0 CV + refit | 3.06M pairs, 72 features, 4 folds | 657 s |
 | Test blocking + features | 15.81M candidate pairs (sharing the CPU with cross-encoder training) | 3,082 s |
 | Cross-encoder training | 300k pairs, 1 epoch, 4 threads | 140 min |
-| Cross-encoder scoring | 362k train + 2.17M test pairs (two passes) | about 140 min |
+| Cross-encoder scoring (CPU version) | 362k train + 2.17M test pairs (two passes) | about 140 min |
+| Cross-encoder, final (Colab A100) | train on 1.14M pairs; score 3.09M train + 15.8M test pairs | 25 + 40 min |
 | Stack (levels 1–3, ablation) | 3.06M pairs | 34 min |
 | Stack prediction | 15.81M test pairs | about 12 min |
 
@@ -398,7 +412,7 @@ Top level-0 features by gain: `stage1`, `addr_tset`, `t_gap_best`, `comb_cos`, `
 
 The official validator (`utils/validate_submission.py`, run with `--check-ids`) reports
 **PASS** on the final submission. All 1,732,544 S1 entities appear in both files:
-`matching_results.tsv` has 1,631,393 non-empty rows, and `candidate_pairs.tsv` has 1,732,503.
+`matching_results.tsv` has 1,631,326 non-empty rows, and `candidate_pairs.tsv` has 1,732,503.
 
 ### C. Rejected Experiment: Graph Neural Network
 The candidate pairs form a bipartite graph between S1 entities and S2/S3 records. A graph
