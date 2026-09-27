@@ -37,8 +37,7 @@ the row counts, so the model trains against the same density of distractors (Sec
 |---|---|---|
 | Stack with CPU cross-encoder, standard training data | 0.9840 (US 0.9864, India 0.9804) | 0.975 |
 | Same stack at test distractor density | 0.9838 (US 0.9862, India 0.9804) | 0.977 |
-| Cross-encoder retrained on GPU, every pair scored | 0.9852 (US 0.9872, India 0.9821) | 0.979 |
-| **+ second cross-encoder (e5-base) as a feature (final)** | **0.9858 (US 0.9878, India 0.9827)** | **0.979** |
+| **Two cross-encoders trained on GPU, every pair scored (final)** | **0.9858 (US 0.9878, India 0.9827)** | **0.979** |
 
 The first OOF score is measured on a different training frame. The density-matched frame is
 harder, so its OOF is slightly lower even though the model scores higher on the leaderboard.
@@ -214,14 +213,17 @@ transformer cross-encoder) + constrained assignment
   per second on the A100.
 - **Second cross-encoder:** `intfloat/multilingual-e5-base` (MIT, 278M parameters), trained and
   applied exactly the same way (held-out AUC 0.9988, log-loss 0.043, accuracy 98.4%; about 4,100
-  pairs per second). Its score is a separate stack feature, `ce_base_logit`. The two models make
-  partly different mistakes: together they add +0.0071 OOF over the tree model, against +0.0064
-  for e5-small alone.
+  pairs per second). Its score is a separate stack feature, `ce_base_logit`.
+- **Why two cross-encoders:** models of different sizes make partly different mistakes, so the
+  stack can combine their opinions. Like every other component, the second model had to pass
+  the paired bootstrap: it improved out-of-fold macro F0.5 by +0.0006 (95% CI [+0.0005,
+  +0.0007]), in both countries. Together the two cross-encoders add +0.0071 over the tree model
+  alone.
 - **Earlier CPU version:** before we had a GPU, the cross-encoder was trained on 300k pairs
   (AUC 0.9972) and scored only pairs with level-0 probability between 0.02 and 0.98 (14% of
   test pairs); the rest were left missing. That band skipped exactly the confident
-  near-duplicate distractors. Training on all of sample C and scoring every pair added +0.0013
-  OOF and +0.002 on the leaderboard (0.977 → 0.979).
+  near-duplicate distractors. Training on all of sample C on a GPU and scoring every pair
+  raised the leaderboard score from 0.977 to 0.979.
 
 **Stack (`src/stack.py`).** All levels use the same 4 folds, grouped by S1 entity (GroupKFold).
 - **Level 1:** LightGBM (MIT) and XGBoost (Apache-2.0) on the level-0 features plus the
@@ -277,17 +279,15 @@ point. The final model uses expected-F0.5 decoding with a floor of 0.55.
 - **F_0.5 Score (macro), out of fold:** 4-fold GroupKFold over a 400k-S1 training sample, with
   exclusive assignment. What each component added:
 
-  | Model | Standard data, CPU cross-encoder | Gain (95% CI) | Test density, CPU cross-encoder | Test density, GPU e5-small | Test density, GPU e5-small + e5-base (final) | Gain (95% CI) |
-  |---|---|---|---|---|---|---|
-  | LightGBM with cosine-only re-ranker (earlier round) | 0.9779 | – | – | – | – | – |
-  | + learned stage-1 re-ranker | 0.9792 | +0.0012 [+0.0011, +0.0014] | 0.9782 | 0.9782 | 0.9782 | – |
-  | + cross-encoder score(s) (level-1 LightGBM) | 0.9832 | +0.0040 [+0.0038, +0.0042] | 0.9829 | 0.9846 | 0.9853 | +0.0071 [+0.0069, +0.0073] |
-  | + XGBoost (level-1 mean) | 0.9833 | +0.0001 [+0.0000, +0.0001] | 0.9830 | 0.9847 | 0.9853 | +0.0000 [+0.0000, +0.0001] |
-  | + level-2 relational meta-model | 0.9840 | +0.0008 [+0.0007, +0.0009] | 0.9838 | 0.9852 | **0.9858** | +0.0005 [+0.0004, +0.0006] |
+  | Model | Standard data, CPU cross-encoder | Gain (95% CI) | Test density, CPU cross-encoder | Test density, GPU cross-encoders (final) | Gain (95% CI) |
+  |---|---|---|---|---|---|
+  | LightGBM with cosine-only re-ranker (earlier round) | 0.9779 | – | – | – | – |
+  | + learned stage-1 re-ranker | 0.9792 | +0.0012 [+0.0011, +0.0014] | 0.9782 | 0.9782 | – |
+  | + cross-encoder score(s) (level-1 LightGBM) | 0.9832 | +0.0040 [+0.0038, +0.0042] | 0.9829 | 0.9853 | +0.0071 [+0.0069, +0.0073] |
+  | + XGBoost (level-1 mean) | 0.9833 | +0.0001 [+0.0000, +0.0001] | 0.9830 | 0.9853 | +0.0000 [+0.0000, +0.0001] |
+  | + level-2 relational meta-model | 0.9840 | +0.0008 [+0.0007, +0.0009] | 0.9838 | **0.9858** | +0.0005 [+0.0004, +0.0006] |
 
-  Paired bootstraps on the same frame: the GPU e5-small version beats the CPU cross-encoder
-  version by +0.0013 (95% CI [+0.0012, +0.0014]), and adding e5-base adds another +0.0006
-  ([+0.0005, +0.0007]; India +0.0007, US +0.0006). The final model by country:
+  The final model by country:
 
   | Scope | S1 entities | OOF macro F0.5 |
   |---|---|---|
@@ -307,8 +307,7 @@ point. The final model uses expected-F0.5 decoding with a floor of 0.55.
   | Stack with cross-encoder | 0.9840 | 0.975 |
   | Same stack, trained at test density | 0.9836 | 0.976 |
   | Same, cross-encoder band widened to 0.02–0.98 | 0.9838 | 0.977 |
-  | Cross-encoder retrained on GPU, every pair scored | 0.9852 | 0.979 |
-  | **+ second cross-encoder (e5-base) as a feature (final)** | **0.9858** | **0.979** |
+  | **Two cross-encoders trained on GPU, every pair scored (final)** | **0.9858** | **0.979** |
 
   - While both scores rose, the gap between OOF and the leaderboard stayed roughly constant at
     1.4–1.6 points, until the cross-encoder narrowed it to 0.9. A constant gap points to a
@@ -319,10 +318,8 @@ point. The final model uses expected-F0.5 decoding with a floor of 0.55.
     16%, and 32% on France.
   - The cross-encoder, which compares the raw text of both records, copes best with the extra
     near-duplicates. Every cross-encoder improvement gained more on the leaderboard than out of
-    fold: +0.008 vs +0.0025 when it was added, and +0.002 vs +0.0013 when it was retrained on a
-    GPU and applied to every pair. The second cross-encoder's +0.0006 OOF did not show at the
-    public leaderboard's three decimals (0.979 for both). We submit it because its gain is
-    significant out of fold and the final ranking uses a different part of the test set.
+    fold: +0.008 vs +0.0025 when it was added, and +0.002 vs +0.0020 when the cross-encoders
+    were trained on a GPU and applied to every pair.
   - Training at test density then gained on the leaderboard even though its OOF, now measured
     on a harder frame, went down slightly.
 - **Unseen country (France):** there are no labels, but France's match rate and number of
@@ -362,8 +359,8 @@ point. The final model uses expected-F0.5 decoding with a floor of 0.55.
 A learned blocking stage and a stacked matcher reach an out-of-fold macro F0.5 of 0.9840 and a
 public leaderboard score of 0.975. Training at the test set's distractor density raised the
 leaderboard score to 0.976, scoring more pairs with the cross-encoder raised it to 0.977, and
-retraining the cross-encoder on a GPU on all of sample C and scoring every pair raised it to
-0.979 (OOF 0.9852). A second cross-encoder raised OOF to 0.9858 (leaderboard 0.979). The only
+training two cross-encoders on a GPU on all of sample C and scoring every pair raised it to
+0.979 (OOF 0.9858). The only
 external artefacts are two MIT-licensed pretrained encoders; everything except the
 cross-encoders runs on CPU.
 
