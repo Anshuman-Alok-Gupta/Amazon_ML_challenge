@@ -4,8 +4,6 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from metrics import macro_f05
-
 
 def exclusive(pairs: pd.DataFrame, prob_col: str = "prob") -> pd.DataFrame:
     """Keep, for every S2/S3 record, only its highest-probability S1 entity."""
@@ -70,18 +68,56 @@ def to_lists(p: pd.DataFrame) -> dict[str, list[str]]:
     return p.groupby("s1_id", sort=False)["cand_id"].apply(list).to_dict()
 
 
+class MacroScorer:
+    """macro_f05 of many candidate selections from one pair frame, vectorised.
+
+    Per S1: F0.5 = 1.25 tp / (0.25 n_true + n_pred) (0 when tp = 0), and 1.0 for a singleton
+    with an empty list -- the same numbers as metrics.macro_f05, via bincount instead of Python
+    sets, so a threshold grid over 400k entities takes seconds instead of many minutes.
+    """
+
+    def __init__(self, base: pd.DataFrame, gt: dict, s1_ids):
+        ids = pd.Index(list(s1_ids))
+        self.n = len(ids)
+        self.n_true = np.array([len(gt.get(s, ())) for s in ids], dtype=np.float64)
+        code = ids.get_indexer(base["s1_id"].to_numpy(object))
+        keep = code >= 0  # pairs of S1 entities outside s1_ids do not count
+        self.code = pd.Series(np.where(keep, code, 0), index=base.index)
+        self.y = pd.Series(keep & np.fromiter((c in gt.get(a, ()) for a, c in zip(base["s1_id"], base["cand_id"])),
+                                              dtype=bool, count=len(base)), index=base.index)
+        self.valid = pd.Series(keep, index=base.index)
+
+    def per_entity(self, index) -> np.ndarray:
+        """F0.5 of every S1 (in s1_ids order) when exactly the base rows with these labels are predicted."""
+        v = self.valid.loc[index].to_numpy()
+        code = self.code.loc[index].to_numpy()[v]
+        tp = np.bincount(code, weights=self.y.loc[index].to_numpy()[v], minlength=self.n)
+        npred = np.bincount(code, minlength=self.n).astype(np.float64)
+        return np.where(self.n_true == 0, (npred == 0).astype(np.float64),
+                        1.25 * tp / np.maximum(0.25 * self.n_true + npred, 1e-12))
+
+    def score(self, index) -> float:
+        """Macro F0.5 when exactly the base rows with these index labels are predicted."""
+        return float(self.per_entity(index).mean()) if self.n else float("nan")
+
+
+def _plateau_middle(grid, scores) -> tuple[float, float]:
+    # Middle of the best plateau: more robust to calibration shift (e.g. an unseen country).
+    best = np.flatnonzero(scores >= scores.max() - 1e-6)
+    i = best[len(best) // 2]
+    return float(grid[i]), float(scores[i])
+
+
 def tune_threshold(pairs: pd.DataFrame, gt: dict, s1_ids, use_exclusive: bool,
                    prob_col: str = "prob", grid=None) -> tuple[float, float]:
     """Grid-search the probability cut-off that maximises macro F0.5 (singletons included)."""
     grid = np.round(np.arange(0.05, 0.96, 0.01), 2) if grid is None else grid
     base = exclusive(pairs, prob_col) if use_exclusive else pairs
     base = base[base[prob_col] >= grid.min()]
-    scores = np.array([macro_f05(select(base, t, use_exclusive=False, prob_col=prob_col), gt, s1_ids)
-                       for t in grid])
-    # Middle of the best plateau: more robust to calibration shift (e.g. an unseen country).
-    best = np.flatnonzero(scores >= scores.max() - 1e-6)
-    i = best[len(best) // 2]
-    return float(grid[i]), float(scores[i])
+    sc = MacroScorer(base, gt, s1_ids)
+    prob = base[prob_col].to_numpy()
+    scores = np.array([sc.score(base.index[prob >= t]) for t in grid])
+    return _plateau_middle(grid, scores)
 
 
 def tune_expected_f(pairs: pd.DataFrame, gt: dict, s1_ids, use_exclusive: bool,
@@ -89,8 +125,6 @@ def tune_expected_f(pairs: pd.DataFrame, gt: dict, s1_ids, use_exclusive: bool,
     """Floor for select_expected_f, chosen the same way as the threshold (plateau middle)."""
     grid = np.round(np.arange(0.30, 0.91, 0.05), 2) if grid is None else grid
     base = exclusive(pairs, prob_col) if use_exclusive else pairs
-    scores = np.array([macro_f05(to_lists(select_expected_f(base, t, False, prob_col)), gt, s1_ids)
-                       for t in grid])
-    best = np.flatnonzero(scores >= scores.max() - 1e-6)
-    i = best[len(best) // 2]
-    return float(grid[i]), float(scores[i])
+    sc = MacroScorer(base, gt, s1_ids)
+    scores = np.array([sc.score(select_expected_f(base, t, False, prob_col).index) for t in grid])
+    return _plateau_middle(grid, scores)
