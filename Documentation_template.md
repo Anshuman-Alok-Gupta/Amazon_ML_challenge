@@ -1,8 +1,8 @@
 # ML Challenge 2026: Business Entity Resolution Solution Template
 
-**Team Name:** [Your Team Name]  
-**Team Members:** [List all team members]  
-**Submission Date:** [Date]
+**Team Name:** Ouch Ouch  
+**Team Members:** Pranjal Jayesh Bhamare, Anshuman Gupta, Rishi Gandhi, Anushka Dipak Pandore  
+**Submission Date:** 27/09/2026
 
 ---
 
