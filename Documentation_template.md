@@ -271,12 +271,12 @@ decoding with floor 0.45.
 
   | Test country | S1 entities | S1 with ≥ 1 match | Avg matches per S1 |
   |---|---|---|---|
-  | France | 259,452 | 94.8% | 3.39 |
-  | India | 809,986 | 94.1% | 3.31 |
-  | US | 663,106 | 94.3% | 3.39 |
+  | France | 259,452 | 94.7% | 3.36 |
+  | India | 809,986 | 94.0% | 3.30 |
+  | US | 663,106 | 94.3% | 3.38 |
 
-  Overall, 1,633,146 of the 1,732,544 test S1 entities (94.3%) have at least one match, and there
-  are 5,806,707 matched pairs. In training, 94.4% of S1 entities have at least one true link.
+  Overall, 1,632,486 of the 1,732,544 test S1 entities (94.2%) have at least one match, and there
+  are 5,788,266 matched pairs (final submission). In training, 94.4% of S1 entities have at least one true link.
 - **Error analysis** (level-0 model, OOF errors for 20,000 S1 entities; about 93% of wrong pairs
   are false negatives, the intended trade-off for F0.5):
   - **Common false positives (wrong merges):** near-duplicate distractors. These have the same or
@@ -358,8 +358,33 @@ Top level-0 features by gain: `stage1`, `addr_tset`, `t_gap_best`, `comb_cos`, `
 `t_is_best`, `first_num_equal`.
 
 Validator (`utils/validate_submission.py`, run with `--check-ids`): **PASS**. It found every
-one of the 1,732,544 S1 entities in both files: `matching_results.tsv` has 1,633,146 non-empty
-rows and `candidate_pairs.tsv` has 1,732,503 non-empty rows.
+one of the 1,732,544 S1 entities in both files: `matching_results.tsv` has 1,632,486 non-empty
+rows and `candidate_pairs.tsv` has 1,732,503 non-empty rows (final submission).
+
+### C. Rejected Experiment: Graph Neural Network
+The candidate pairs form a bipartite graph (S1 entities ↔ S2/S3 records). A GNN can read what
+the other candidates of the same S1, and the other S1 entities claiming the same record, say
+about a pair. It was tried and **not used**, because it lost on the leaderboard. The code is on
+the repository's `gnn` branch.
+
+- **Training graph.** The stack's training frame is an S1 sample (~18%), so most competing S1
+  entities of a record are missing from it. The GNN was therefore trained on a separate frame:
+  every S1 entity of a seeded 15% of the training regions (193k S1, 1.54M pairs), with the same
+  18.7% of S1 hidden as in the final model. The stack was refit without those S1 entities, so
+  its scores on the graph frame are out-of-sample.
+- **Model.** Edge states (the level-2 input and logit, plus node degrees) are passed through
+  3 rounds of message passing over S1 nodes, record nodes and (S1, source) groups:
+  leave-one-out mean, max, and a softmax "competition" term. The output is the level-2 logit
+  plus a correction whose last layer starts at zero. Training is transductive with 4 S1 folds:
+  every edge is visible, and only training-fold labels enter the loss.
+- **Result.** Out of fold on the graph frame it scored 0.9828 against 0.9792 for the level-2
+  stack on the same S1 (+0.0036, 95% CI [+0.0034, +0.0038]; US +0.0039, India +0.0026), with
+  matching train and validation loss. On the public leaderboard it scored **0.970 against 0.976**.
+- **Likely causes.** The graph frame keeps all region-less records of a country but only 15% of
+  its regions, so record-side competition, the signal the GNN relies on, is not distributed as
+  on test. France (23% of test pairs) has no training data, and the learned correction can
+  misfire on it. The refit stack behind the GNN also lost about 11% of its training sample.
+  An out-of-fold gain measured on a different frame was not a reliable guide.
 
 ---
 
