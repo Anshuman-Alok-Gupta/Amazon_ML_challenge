@@ -4,7 +4,7 @@ For each Source 1 record, find the Source 2 / Source 3 records that describe the
 The pipeline runs on CPU (a GPU only speeds up the optional cross-encoder) and uses no external
 data or services; the only download is the pretrained multilingual-e5-small weights (MIT
 license, 118M parameters). The level-0 pipeline is sized for about 12M records per split on a
-16 GB laptop; the stack and cross-encoder were run on a 32 GB EC2 m7i.2xlarge.
+16 GB laptop; the final run (stack and cross-encoder included) used a 32 GB EC2 m7i.2xlarge.
 
 ```
 TSVs -> normalize (parallel, parquet cache)
@@ -37,34 +37,44 @@ student_resource/dataset/test/test_source{1,2,3}.tsv
 Override with `--data-dir` / `ER_DATA_DIR`. Normalised parquet caches go to `cache/` (`--cache-dir` /
 `ER_CACHE_DIR`), keyed by a hash of `normalize.py`.
 
-## Run (from this folder)
+## Reproduce the final submission (from this folder)
+```bash
+# 1. stage-1 re-ranker and the cross-encoder, trained on the standard (un-hidden) training data
+python src/pipeline.py train --sample 400000                 # samples A/B/C, stage-1 re-ranker -> artifacts/stage1.txt
+python src/pipeline.py ce-train                              # cross-encoder on sample C (downloads e5-small once)
+# 2. matcher at the test set's distractor density, reusing both models
+python src/pipeline.py train --sample 400000 --hide-s1 auto --reuse-stage1  # level-0 model, training frame
+python src/pipeline.py predict                               # test blocking + features -> cache/frames/test
+python src/pipeline.py ce-score --ce-band 0.02 0.98          # cross-encoder scores for the train / test frames
+python src/pipeline.py stack                                 # level 1 + level 2, ablation -> artifacts/stack.json
+python src/pipeline.py stack-predict                         # -> ../../output/matching_results.tsv, candidate_pairs.tsv
+```
+- `--hide-s1 auto` hides a data-measured share of training S1 entities (about 18.7%) so that
+  training has the test set's density of unmatched records. The hidden entities come from
+  outside samples A, B and C, which is why the stage-1 model and the cross-encoder from step 1
+  can be reused. The run prints `hide-s1 auto: ... h=`.
+- `train` and `predict` cache their model inputs under `cache/frames/`, so the later
+  commands never regenerate candidates.
+- On CPU the cross-encoder trains on 300k pairs and scores only pairs with level-0 probability
+  in [0.02, 0.98]; `--ce-full` trains on all of sample C and scores every pair (GPU).
+- A guard aborts a command when free RAM falls below `--min-free-gb` (default 1.5); pass
+  `--min-free-gb 0` on a dedicated machine. The full run needs about 30 GB of RAM (EC2
+  m7i.2xlarge).
+
+Other commands and options:
 ```bash
 python src/pipeline.py eda          # dataset statistics
-python src/pipeline.py train        # 200k-entity train sample: blocking recall, 4-fold OOF macro F0.5,
-                                    # threshold, final model -> artifacts/
 python src/pipeline.py validate     # leave-one-country-out check (stands in for unseen France)
-python src/pipeline.py predict      # full test set -> ../../output/*.tsv
-python src/pipeline.py all          # train + predict (full reproduction of the level-0 model)
-python src/pipeline.py ce-train     # cross-encoder on train sample C (GPU if present; CPU budget otherwise)
-python src/pipeline.py ce-score     # cross-encoder logits for the cached train / test frames
-python src/pipeline.py stack        # level-1 ensemble + level-2 meta-model, ablation, -> artifacts/stack.json
-python src/pipeline.py stack-predict  # final outputs from the cached test frame with the chosen level
+python src/pipeline.py all          # train + predict (level-0 model only)
 ```
-`train` and `predict` cache their model inputs (pairs, features) under `cache/frames/`, so the
-four later commands never regenerate candidates. Full order: `all`, `ce-train`, `ce-score`,
-`stack`, `stack-predict` (`aws/run_on_ec2.sh` all, then gpu). On a CPU-only machine the
-cross-encoder trains on 300k pairs and scores only pairs with level-0 probability in
-[0.02, 0.98]; `--ce-full` uses all pairs (GPU). The first `ce-train` downloads
-`intfloat/multilingual-e5-small` from the Hugging Face hub (pretrained weights only).
-Options: `--sample N` (train S1 sample size), `--dump-errors` (OOF FP/FN pairs to `artifacts/`),
-`--baseline DIR` (paired bootstrap of per-entity OOF F0.5 against an earlier run's artifacts),
-`--min-free-gb` (abort instead of swapping when free RAM falls below this, default 1.5),
-`--ce-sample N` (size of the cross-encoder's training sample C, default 150k),
-`--ce-band LO HI` (score only pairs with level-0 probability in [LO, HI]; widening the band later
-scores only the new pairs), `--ce-full` (train on all of sample C and score every pair; GPU).
+`--sample N` (size of the matcher's training sample B, default 200k), `--ce-sample N` (size of
+the cross-encoder's sample C, default 150k), `--ce-band LO HI` (widening the band later scores
+only the new pairs), `--reuse-stage1` (reuse `artifacts/stage1.txt`), `--use-cat` (add CatBoost
+to level 1 in `stack`), `--baseline DIR` (paired bootstrap of per-entity OOF F0.5 against an
+earlier run), `--dump-errors` (OOF false positives / negatives to `artifacts/`).
 
-Results of the full run (EC2 m7i.2xlarge, CPU only): OOF macro F0.5 0.9840 (US 0.9864, India
-0.9804) with the cross-encoder stack, 0.975 on the public leaderboard.
+Results of the final run (EC2 m7i.2xlarge, CPU only): OOF macro F0.5 0.9838 (US 0.9862, India
+0.9804) at test density, 0.977 on the public leaderboard.
 
 Then run the official checker from `student_resource/`:
 ```bash
