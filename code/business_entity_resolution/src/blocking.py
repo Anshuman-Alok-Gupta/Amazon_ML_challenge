@@ -11,8 +11,8 @@ Per country, three L2-normalised IDF-weighted views share one vocabulary -- name
 name+address. For each Source 1 record a deep pool of Source 2 / Source 3 records is retrieved
 under every view (multithreaded sparse top-n matmul). Many businesses share a name across
 cities, so raw view scores rank poorly; a small LightGBM ("stage 1") re-ranks the pool from the
-view scores and their ranks, and the top `keep_per_source` per (S1, source) become the
-candidates. Those candidates are exactly what the matching model scores (candidate_pairs.tsv).
+view scores, cheap name / house-number evidence and their ranks, and the top `keep_per_source`
+per (S1, source) become the candidates. Those candidates are exactly what the matching model scores (candidate_pairs.tsv).
 """
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ import re
 
 import numpy as np
 import pandas as pd
+from rapidfuzz import fuzz
+from rapidfuzz.process import cpdist
 from scipy import sparse
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.preprocessing import normalize as l2norm
@@ -202,15 +204,67 @@ def pool(idx: TokenIndex, tgt_source: np.ndarray, query: np.ndarray, cfg: Blocki
     return p
 
 
+# cheap pair evidence added to the pool (pool_features): the cosine views alone cannot tell a
+# same-address record with a garbled / native-script name, or a changed house number, from
+# the many same-name decoys of a region
+POOL_EXTRA = ["name_tset", "name_cov_t", "name_cov_s1", "cskel_shared", "num_shared", "num_jac",
+              "first_num_eq", "t_nonlatin", "t_addr_empty"]
 STAGE1_FEATURES = ["comb_cos", "name_cos", "addr_cos", "prod", "is_s3", "n_pool",
                    "rk_comb_cos", "rk_name_cos", "rk_addr_cos", "gap_comb_cos", "gap_name_cos",
-                   "gap_addr_cos", "rk_prod", "gap_prod", "rk_comb_all"]
+                   "gap_addr_cos", "rk_prod", "gap_prod", "rk_comb_all"] + POOL_EXTRA + ["rk_name_tset", "rk_num_jac"]
+
+
+def shared_mass(idx: TokenIndex, l1: np.ndarray, lt: np.ndarray, kinds, chunk: int = 1_000_000) -> dict:
+    """IDF mass of the tokens each (S1 row, target row) pair shares, per token kind."""
+    lt_g = lt + idx.n1  # target rows follow S1 rows in the index
+    out = {k: np.empty(len(l1), np.float32) for k in kinds}
+    for s in range(0, len(l1), chunk):
+        P = idx.X[l1[s:s + chunk]].multiply(idx.X[lt_g[s:s + chunk]]).tocsr()
+        for k in kinds:
+            out[k][s:s + chunk] = P @ idx.w[k]
+    return out
+
+
+class BlockText:
+    """Per-block record columns as numpy object arrays, so pool pairs index them cheaply."""
+
+    def __init__(self, s1: pd.DataFrame, tgt: pd.DataFrame):
+        def first_num(df):
+            return df["addr_numbers"].str.split(" ", n=1).str[0].to_numpy(object)
+        self.name1, self.name_t = s1["name_core"].to_numpy(object), tgt["name_core"].to_numpy(object)
+        self.num1, self.num_t = first_num(s1), first_num(tgt)
+        self.nonlatin_t = tgt["name_nonlatin"].to_numpy().astype(np.float32)
+        self.addr_empty_t = (tgt["addr_clean"].to_numpy(object) == "").astype(np.float32)
+
+
+def pool_features(p: pd.DataFrame, idx: TokenIndex, text: BlockText) -> pd.DataFrame:
+    """Add POOL_EXTRA columns to a retrieval pool (see stage1_features)."""
+    l1, lt = p["l1"].to_numpy(), p["lt"].to_numpy()
+    if len(p) == 0:
+        return p.assign(**{c: np.empty(0, np.float32) for c in POOL_EXTRA})
+    p["name_tset"] = cpdist(text.name1[l1], text.name_t[lt], scorer=fuzz.token_set_ratio, workers=-1,
+                            dtype=np.float32)
+    sh = shared_mass(idx, l1, lt, ("name", "cskel", "num"))
+    ma, mb = idx.mass["name"][l1], idx.mass["name"][lt + idx.n1]
+    p["name_cov_t"] = np.where(mb > 0, sh["name"] / np.maximum(mb, 1e-6), np.nan).astype(np.float32)
+    p["name_cov_s1"] = np.where(ma > 0, sh["name"] / np.maximum(ma, 1e-6), np.nan).astype(np.float32)
+    p["cskel_shared"] = sh["cskel"]
+    na, nb = idx.mass["num"][l1], idx.mass["num"][lt + idx.n1]
+    p["num_shared"] = sh["num"]
+    p["num_jac"] = np.where((na > 0) & (nb > 0), sh["num"] / np.maximum(na + nb - sh["num"], 1),
+                            np.nan).astype(np.float32)
+    fa, fb = text.num1[l1], text.num_t[lt]
+    p["first_num_eq"] = np.where((fa != "") & (fb != ""), (fa == fb).astype(np.float32), np.nan)
+    p["t_nonlatin"], p["t_addr_empty"] = text.nonlatin_t[lt], text.addr_empty_t[lt]
+    return p
 
 
 def stage1_features(p: pd.DataFrame) -> pd.DataFrame:
     """Cheap re-ranking features: view scores and how they compare within the S1's pool."""
     F = pd.DataFrame({c: p[c].to_numpy() for c in ("comb_cos", "name_cos", "addr_cos")})
     F["prod"] = F["name_cos"] * F["addr_cos"]
+    for c in POOL_EXTRA:
+        F[c] = p[c].to_numpy()
     F["is_s3"] = (p["source"].to_numpy() == 3).astype(np.float32)
     key = pd.DataFrame({"l1": p["l1"].to_numpy(), "src": p["source"].to_numpy()})
     g = pd.concat([key, F], axis=1).groupby(["l1", "src"])
@@ -219,6 +273,9 @@ def stage1_features(p: pd.DataFrame) -> pd.DataFrame:
         F[f"rk_{c}"] = g[c].rank(ascending=False, method="average").to_numpy()
         F[f"gap_{c}"] = (g[c].transform("max") - F[c]).to_numpy()
     F["rk_comb_all"] = F.groupby(key["l1"])["comb_cos"].rank(ascending=False, method="average").to_numpy()
+    g = pd.concat([key, F[["name_tset", "num_jac"]].fillna(-1)], axis=1).groupby(["l1", "src"])
+    F["rk_name_tset"] = g["name_tset"].rank(ascending=False, method="average").to_numpy()
+    F["rk_num_jac"] = g["num_jac"].rank(ascending=False, method="average").to_numpy()
     return F[STAGE1_FEATURES].astype(np.float32)
 
 

@@ -22,6 +22,7 @@ from pathlib import Path
 os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
 
 import lightgbm as lgb
+import pyarrow.parquet as pq
 import numpy as np
 import pandas as pd
 
@@ -30,7 +31,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import eda  # noqa: E402
 import model as mdl  # noqa: E402
 import normalize  # noqa: E402
-from blocking import TokenIndex, keep_top, make_blocks, make_target, pool, stage1_features, target_best  # noqa: E402
+from blocking import (BlockText, TokenIndex, keep_top, make_blocks, make_target, pool,  # noqa: E402
+                      pool_features, stage1_features, target_best)
 from config import (DEFAULT_ARTIFACT_DIR, DEFAULT_CACHE_DIR, DEFAULT_DATA_DIR,  # noqa: E402
                     DEFAULT_OUTPUT_DIR, SEED, BlockingConfig, ModelConfig, PostConfig, TrainConfig)
 from features import build_features  # noqa: E402
@@ -123,6 +125,13 @@ class SplitData:
         self.s1_ids = s1["entity_id"].to_numpy()
         self.s1_country = s1["country"].to_numpy()
         self.countries = sorted(s1["country_norm"].unique())
+        self.hidden: set = set()
+
+    def hide(self, ids):
+        """Drop these S1 entities from every later step (their targets become orphans)."""
+        self.hidden = set(ids)
+        keep = ~pd.Index(self.s1_ids).isin(self.hidden)
+        self.s1_ids, self.s1_country = self.s1_ids[keep], self.s1_country[keep]
 
     def _resolve(self, df: pd.DataFrame, country: str | None = None) -> pd.Series:
         """Region column with multi-candidate values resolved (per row country, or `country`)."""
@@ -160,6 +169,8 @@ class SplitData:
     def load(self, country: str, cols=FEATURE_COLS):
         f = [("country_norm", "==", country)]
         s1 = pd.read_parquet(self.paths["s1"], columns=cols, filters=f)
+        if self.hidden:
+            s1 = s1[~s1["entity_id"].isin(self.hidden)].reset_index(drop=True)
         tgt = make_target(pd.read_parquet(self.paths["s2"], columns=cols, filters=f),
                           pd.read_parquet(self.paths["s3"], columns=cols, filters=f))
         if "region" in s1.columns:
@@ -202,7 +213,7 @@ def _s1_chunks(l1: np.ndarray, chunk_pairs: int):
 
 
 def _blocks(data: SplitData, bcfg: BlockingConfig, query_ids):
-    """Yield (block name, s1 frame, target frame, queried S1 rows, TokenIndex, name_freq) per block.
+    """Yield (block name, s1 frame, target frame, queried S1 rows, TokenIndex, BlockText, name_freq).
 
     A country's records are loaded once and split into region blocks (see make_blocks); each
     block gets its own small index, so memory stays bounded and decoys from other regions never
@@ -223,7 +234,7 @@ def _blocks(data: SplitData, bcfg: BlockingConfig, query_ids):
             s1_b = s1_all.iloc[i1].reset_index(drop=True)
             tgt_b = tgt_all.iloc[it].reset_index(drop=True)
             idx = TokenIndex(s1_b, tgt_b, bcfg)
-            yield f"{c}/{name}", s1_b, tgt_b, q, idx, name_freq
+            yield f"{c}/{name}", s1_b, tgt_b, q, idx, BlockText(s1_b, tgt_b), name_freq
             del idx, s1_b, tgt_b
             gc.collect()
         del s1_all, tgt_all
@@ -234,10 +245,10 @@ def stage1_pools(data: SplitData, bcfg: BlockingConfig, query_ids, gt: dict):
     """Retrieval pools with stage-1 features and labels, used to train the re-ranker."""
     feats, ys = [], []
     with Timer("stage-1 pools"):
-        for name, s1_b, tgt_b, q, idx, _ in _blocks(data, bcfg, query_ids):
+        for name, s1_b, tgt_b, q, idx, text, _ in _blocks(data, bcfg, query_ids):
             src = tgt_b["source"].to_numpy()
             for s in range(0, len(q), bcfg.query_chunk):
-                p = pool(idx, src, q[s:s + bcfg.query_chunk], bcfg)
+                p = pool_features(pool(idx, src, q[s:s + bcfg.query_chunk], bcfg), idx, text)
                 sid = s1_b["entity_id"].to_numpy()[p["l1"].to_numpy()]
                 cid = tgt_b["entity_id"].to_numpy()[p["lt"].to_numpy()]
                 feats.append(stage1_features(p))
@@ -254,11 +265,11 @@ def generate(data: SplitData, bcfg: BlockingConfig, query_ids, stage1, on_chunk,
     """
     total = n_pool = n_q = 0
     t0 = time.perf_counter()
-    for name, s1_b, tgt_b, q, idx, name_freq in _blocks(data, bcfg, query_ids):
+    for name, s1_b, tgt_b, q, idx, text, name_freq in _blocks(data, bcfg, query_ids):
         src = tgt_b["source"].to_numpy()
         kept = []
         for s in range(0, len(q), bcfg.query_chunk):
-            p = pool(idx, src, q[s:s + bcfg.query_chunk], bcfg)
+            p = pool_features(pool(idx, src, q[s:s + bcfg.query_chunk], bcfg), idx, text)
             n_pool += len(p)
             if len(p):  # tiny blocks can retrieve nothing
                 kept.append(keep_top(p, stage1.predict(stage1_features(p)), bcfg))
@@ -288,10 +299,29 @@ def generate(data: SplitData, bcfg: BlockingConfig, query_ids, stage1, on_chunk,
     return total
 
 
-def collect(data: SplitData, bcfg, query_ids, stage1):
-    parts_p, parts_x = [], []
-    generate(data, bcfg, query_ids, stage1, lambda p, x: (parts_p.append(p), parts_x.append(x)))
-    return pd.concat(parts_p, ignore_index=True), pd.concat(parts_x, ignore_index=True)
+def frame_dir(args, name: str) -> Path:
+    """Cached model-input frames (train = sample B, ce = sample C, test) live under the cache dir."""
+    return Path(args.cache_dir) / "frames" / name
+
+
+class FrameWriter:
+    """Streams (pairs, X) chunks of a split into pairs.parquet / X.parquet (same row order)."""
+
+    def __init__(self, d: Path):
+        self.d, self.w = Path(d), {}
+
+    def write(self, pairs: pd.DataFrame, X: pd.DataFrame):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        for name, df in (("pairs", pairs), ("X", X)):
+            t = pa.Table.from_pandas(df.reset_index(drop=True), preserve_index=False)
+            if name not in self.w:
+                self.w[name] = (pq.ParquetWriter(self.d / f"{name}.parquet", t.schema), t.schema)
+            self.w[name][0].write_table(t.cast(self.w[name][1]))
+
+    def close(self):
+        for w, _ in self.w.values():
+            w.close()
 
 
 def labels(pairs: pd.DataFrame, gt: dict) -> np.ndarray:
@@ -302,15 +332,49 @@ def id_lists(pairs: pd.DataFrame) -> dict[str, list[str]]:
     return pairs.groupby("s1_id", sort=False)["cand_id"].apply(list).to_dict()
 
 
+def hide_fraction(args) -> float:
+    """--hide-s1: fraction of train S1 to hide so train has test's targets-per-S1 density.
+
+    'auto' measures it from the row counts: h = 1 - (train targets/S1) / (test targets/S1).
+    """
+    v = str(getattr(args, "hide_s1", "0"))
+    if v != "auto":
+        return float(v)
+    SplitData(args.data_dir, "test", args.cache_dir)  # builds the test caches if missing
+    rate = {}
+    for split in ("train", "test"):
+        n = {k: pq.ParquetFile(p).metadata.num_rows for k, p in cache_paths(args, split).items()}
+        rate[split] = (n["s2"] + n["s3"]) / n["s1"]
+    h = float(np.clip(1 - rate["train"] / rate["test"], 0.0, 0.5))
+    print(f"  hide-s1 auto: targets per S1 train {rate['train']:.3f}, test {rate['test']:.3f} -> h={h:.4f}")
+    return h
+
+
 def train_frame(args):
-    """Stage 1 on sample A; candidates, features and labels for a disjoint sample B."""
+    """Stage 1 on sample A; candidates, features and labels for a disjoint sample B.
+
+    Also returns the candidate pairs (with labels) of a third disjoint sample C, the training set
+    of the cross-encoder: its scores on B are then out-of-sample, like stage 1's.
+    """
     bcfg, tcfg = BlockingConfig(), TrainConfig()
     data = SplitData(args.data_dir, "train", args.cache_dir, subset=args.subset)
     n_b = args.sample or tcfg.n_s1_sample
-    n_a = min(tcfg.n_stage1_sample, max(len(data.s1_ids) - n_b, len(data.s1_ids) // 4))
+    n_c = tcfg.n_ce_sample if args.ce_sample is None else args.ce_sample
+    n_a = min(tcfg.n_stage1_sample, max(len(data.s1_ids) - n_b - n_c, len(data.s1_ids) // 4))
     perm = np.random.default_rng(SEED).permutation(data.s1_ids)
     ids_a, ids_b = np.sort(perm[:n_a]), np.sort(perm[n_a:n_a + n_b])
-    gt = gt_dict(data.gt, np.concatenate([ids_a, ids_b]))
+    ids_c = np.sort(perm[n_a + n_b:n_a + n_b + n_c])
+    h = hide_fraction(args)
+    if h > 0:
+        # hidden S1 come from outside A/B/C, so the samples (and the trained CE) are unchanged
+        start = n_a + n_b + n_c
+        hidden = perm[start:start + int(round(h * len(perm)))]
+        n_s1 = len(perm)
+        data.hide(hidden)
+        n_tgt = sum(pq.ParquetFile(v).metadata.num_rows for k, v in data.paths.items() if k != "s1")
+        print(f"  hide-s1: h={h:.4f}, hid {len(hidden):,} of {n_s1:,} train S1 -> "
+              f"{n_tgt / len(data.s1_ids):.2f} targets per S1 (was {n_tgt / n_s1:.2f})", flush=True)
+    gt = gt_dict(data.gt, np.concatenate([ids_a, ids_b, ids_c]))
     n_targets = len(data.target_ids())
     countries = pd.Series(data.s1_country, index=data.s1_ids).loc[ids_b]
     del data.gt
@@ -333,33 +397,60 @@ def train_frame(args):
         s1_path.parent.mkdir(parents=True, exist_ok=True)
         stage1.save_model(str(s1_path))
 
-    # stage 2 data: sample B, candidates chosen by the (out-of-sample) stage-1 model
-    pairs, X = collect(data, bcfg, set(ids_b), stage1)
+    # stage 2 data: sample B, candidates chosen by the (out-of-sample) stage-1 model; sample C's
+    # candidates come from the same pass (features are per pair / per S1, so B is unaffected)
+    set_c = set(ids_c)
+    parts_p, parts_x, parts_c = [], [], []
+
+    def keep(p, x):
+        in_c = p["s1_id"].isin(set_c).to_numpy()
+        if in_c.any():
+            parts_c.append(p[in_c])
+        if not in_c.all():
+            parts_p.append(p[~in_c])
+            parts_x.append(x[~in_c])
+
+    generate(data, bcfg, set(ids_b) | set_c, stage1, keep)
+    pairs, X = pd.concat(parts_p, ignore_index=True), pd.concat(parts_x, ignore_index=True)
+    del parts_p, parts_x
+    pairs_c = (pd.concat(parts_c, ignore_index=True) if parts_c
+               else pd.DataFrame(columns=PAIR_COLS))
+    pairs_c["y"] = labels(pairs_c, {s: gt[s] for s in ids_c})
+    print(f"  sample C (cross-encoder): {len(ids_c):,} S1, {len(pairs_c):,} pairs, "
+          f"positives {pairs_c['y'].mean() if len(pairs_c) else 0:.3f}")
     gt_b = {s: gt[s] for s in ids_b}
     y = labels(pairs, gt_b)
     rep = blocking_report(id_lists(pairs), gt_b, n_targets, ids_b)
     print("  blocking (sample B): " + ", ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
                                                 for k, v in rep.items()))
-    return stage1, pairs, X, y, gt_b, countries, rep
+    return stage1, pairs, X, y, gt_b, countries, rep, pairs_c
 
 
-def fit_with_cv(pairs, X, y, gt, s1_ids, mcfg: ModelConfig, pcfg: PostConfig):
+def tune_decoder(scored, gt, s1_ids, pcfg: PostConfig, prob_col: str = "prob"):
+    """Tune both decoders on OOF probabilities; keep the better one: (decoder, threshold, f05)."""
+    thr, f = tune_threshold(scored, gt, s1_ids, pcfg.exclusive_candidates, prob_col)
+    print(f"  OOF macro F0.5 = {f:.4f} @ threshold {thr} (exclusive={pcfg.exclusive_candidates})")
+    floor, f_e = tune_expected_f(scored, gt, s1_ids, pcfg.exclusive_candidates, prob_col)
+    print(f"  OOF macro F0.5 = {f_e:.4f} with expected-F decoding, floor {floor}")
+    decoder, thr, f = ("expected_f", floor, f_e) if f_e > f else ("threshold", thr, f)
+    print(f"  decoder: {decoder} @ {thr}")
+    return decoder, thr, f
+
+
+def fit_with_cv(pairs, X, y, gt, s1_ids, mcfg: ModelConfig, pcfg: PostConfig, folds=None):
     """CV -> out-of-fold probs -> tuned decoder -> refit on everything.
 
     Two decoders are compared on the OOF probabilities: the global threshold, and per-S1
     expected-F0.5 decoding (see postprocess.select_expected_f). Each has exactly one tuned
     number (threshold / floor), picked by the same plateau-middle rule; the decoder with the
-    higher OOF score is kept. Returns (booster, scored, decoder, threshold, oof_f05).
+    higher OOF score is kept. Returns (booster, scored, decoder, threshold, oof_f05); `scored`
+    carries the fold of every pair (GroupKFold by S1 unless `folds` is given).
     """
+    folds = mdl.assign_folds(pairs["s1_id"].to_numpy(), mcfg.n_folds) if folds is None else folds
     with Timer("cv"):
-        oof, iters = mdl.train_cv(X, y, pairs["s1_id"].values, mcfg)
-    scored = pairs[["s1_id", "cand_id"]].assign(prob=oof)
-    thr, f = tune_threshold(scored, gt, s1_ids, pcfg.exclusive_candidates)
-    print(f"  OOF macro F0.5 = {f:.4f} @ threshold {thr} (exclusive={pcfg.exclusive_candidates})")
-    floor, f_e = tune_expected_f(scored, gt, s1_ids, pcfg.exclusive_candidates)
-    print(f"  OOF macro F0.5 = {f_e:.4f} with expected-F decoding, floor {floor}")
-    decoder, thr, f = ("expected_f", floor, f_e) if f_e > f else ("threshold", thr, f)
-    print(f"  decoder: {decoder} @ {thr}")
+        oof, iters = mdl.train_cv(X, y, folds, mcfg)
+    scored = pairs[["s1_id", "cand_id"]].assign(prob=oof, fold=folds)
+    decoder, thr, f = tune_decoder(scored, gt, s1_ids, pcfg)
     rounds = int(np.mean(iters) * 1.1)
     with Timer(f"refit ({rounds} rounds)"):
         booster = mdl.fit(X, y, mcfg, rounds)
@@ -380,10 +471,20 @@ def cmd_eda(args):
 
 def cmd_train(args):
     mcfg, pcfg = ModelConfig(), PostConfig()
-    stage1, pairs, X, y, gt, countries, brep = train_frame(args)
+    stage1, pairs, X, y, gt, countries, brep, pairs_c = train_frame(args)
     print(f"  train pairs {len(pairs):,}, positives {y.mean():.3f}, features {X.shape[1]}")
     ids = countries.index.tolist()
     booster, scored, decoder, thr, f = fit_with_cv(pairs, X, y, gt, ids, mcfg, pcfg)
+    with Timer("save frames"):  # inputs of the cross-encoder and stack commands
+        fdir, cdir = frame_dir(args, "train"), frame_dir(args, "ce")
+        fdir.mkdir(parents=True, exist_ok=True)
+        cdir.mkdir(parents=True, exist_ok=True)
+        pairs[PAIR_COLS].assign(fold=scored["fold"].to_numpy(), y=y, prob=scored["prob"].to_numpy()).to_parquet(
+            fdir / "pairs.parquet", index=False)
+        X.to_parquet(fdir / "X.parquet", index=False)
+        pd.DataFrame({"s1_id": ids, "country": countries.loc[ids].to_numpy()}).to_parquet(
+            fdir / "s1.parquet", index=False)
+        pairs_c.to_parquet(cdir / "pairs.parquet", index=False)
     pred = to_lists(select_with(scored, thr, pcfg.exclusive_candidates, decoder))
     for c, cid in countries.groupby(countries).groups.items():
         print(f"  OOF F0.5 [{c}] = {macro_f05(pred, gt, cid):.4f}  (n={len(cid)})")
@@ -407,7 +508,7 @@ def cmd_train(args):
 def cmd_validate(args):
     """Leave-one-country-out: simulates the unseen-country (France) shift of the test set."""
     mcfg, pcfg = ModelConfig(), PostConfig()
-    _, pairs, X, y, gt, countries, _ = train_frame(args)
+    _, pairs, X, y, gt, countries, _, _ = train_frame(args)
     pc = pairs["country"].values
     for c in sorted(countries.unique()):
         tr, te = pc != c, pc == c
@@ -429,11 +530,18 @@ def cmd_predict(args):
     stage1 = lgb.Booster(model_file=str(Path(args.artifact_dir) / "stage1.txt"))
     data = SplitData(args.data_dir, "test", args.cache_dir)
     parts = []
+    fdir = frame_dir(args, "test")
+    fdir.mkdir(parents=True, exist_ok=True)
+    writer = FrameWriter(fdir)
 
     def score(p, X):
-        parts.append(p[["s1_id", "cand_id"]].assign(prob=booster.predict(X[meta["features"]]).astype(np.float32)))
+        prob = booster.predict(X[meta["features"]]).astype(np.float32)
+        parts.append(p[["s1_id", "cand_id"]].assign(prob=prob))
+        writer.write(p.assign(prob=prob), X)
 
     generate(data, bcfg, None, stage1, score)
+    writer.close()
+    pd.DataFrame({"s1_id": data.s1_ids, "country": data.s1_country}).to_parquet(fdir / "s1.parquet", index=False)
     scored = pd.concat(parts, ignore_index=True)
     del parts
     matches = select_with(scored, meta["threshold"], meta["exclusive"], meta.get("decoder", "threshold"))
@@ -451,6 +559,104 @@ def cmd_predict(args):
     print(summary.to_string())
     print(f"candidates: {len(scored):,} pairs ({len(scored) / len(data.s1_ids):.1f} per S1); "
           f"matches: {len(matches):,}; wrote {out}")
+
+
+def cache_paths(args, split: str) -> dict[str, Path]:
+    """Normalised parquet caches of a split (written by SplitData on first use)."""
+    tag = _norm_tag()
+    paths = {k: Path(args.cache_dir) / f"{split}_{k}_{tag}.parquet" for k in ("s1", "s2", "s3")}
+    missing = [str(v) for v in paths.values() if not v.exists()]
+    if missing:
+        raise SystemExit(f"normalised caches missing (run train / predict first): {missing}")
+    return paths
+
+
+def ce_config(args):
+    from config import CEConfig
+    cfg = CEConfig()
+    if args.ce_full:  # GPU budget: all of sample C, every pair scored
+        cfg.max_train_pairs, cfg.band = None, None
+    if args.ce_band:
+        cfg.band = tuple(args.ce_band)
+    return cfg
+
+
+def cmd_ce_train(args):
+    import json
+    import cross_encoder as ce
+    cfg = ce_config(args)
+    pairs = pd.read_parquet(frame_dir(args, "ce") / "pairs.parquet", columns=["s1_id", "cand_id", "y"])
+    with Timer("cross-encoder texts"):
+        texts = ce.load_texts(cache_paths(args, "train").values(), np.r_[pairs["s1_id"], pairs["cand_id"]])
+        a, b = ce.pair_texts(pairs, texts)
+    with Timer("cross-encoder train"):
+        rep = ce.train(a, b, pairs["y"].to_numpy(np.float32), Path(args.artifact_dir) / "ce_model", cfg)
+    (Path(args.artifact_dir) / "ce_report.json").write_text(json.dumps({**rep, "model": cfg.model}, indent=2))
+
+
+def cmd_ce_score(args):
+    """Cross-encoder logit for the train (sample B) and test frames -> frames/<split>/ce.parquet.
+
+    With a band (CPU budget) only pairs whose level-0 probability is in it are scored; the band
+    is applied to the OOF probabilities on train and to the refit model's on test. Scores already
+    in ce.parquet are kept, so widening the band only scores the new pairs.
+    """
+    import cross_encoder as ce
+    cfg = ce_config(args)
+    for split in ("train", "test"):
+        fdir = frame_dir(args, split)
+        pairs = pd.read_parquet(fdir / "pairs.parquet", columns=["s1_id", "cand_id", "prob"])
+        out = np.full(len(pairs), np.nan, np.float32)
+        if (fdir / "ce.parquet").exists():
+            prev = pd.read_parquet(fdir / "ce.parquet")["ce_logit"].to_numpy(np.float32)
+            if len(prev) == len(pairs):
+                out = prev.copy()  # parquet-backed arrays are read-only
+        m = ce.band_mask(pairs["prob"].to_numpy(), cfg.band) & np.isnan(out)
+        print(f"  {split}: scoring {m.sum():,} of {len(pairs):,} pairs (band {cfg.band}; "
+              f"{(~np.isnan(out)).sum():,} already scored)", flush=True)
+        sub = pairs[m]
+        with Timer(f"cross-encoder score {split}"):
+            texts = ce.load_texts(cache_paths(args, split).values(), np.r_[sub["s1_id"], sub["cand_id"]])
+            a, b = ce.pair_texts(sub, texts)
+            del texts
+            out[m] = ce.score(Path(args.artifact_dir) / "ce_model", a, b, cfg)
+        pd.DataFrame({"ce_logit": out}).to_parquet(fdir / "ce.parquet", index=False)
+        del pairs, sub, a, b
+        release_memory()
+
+
+def cmd_stack(args):
+    import stack
+    fdir = frame_dir(args, "train")
+    ids = pd.read_parquet(fdir / "s1.parquet")["s1_id"].tolist()
+    gt = gt_dict(read_ground_truth(Path(args.data_dir) / "train" / "train_ground_truth.tsv"), ids)
+    paths = cache_paths(args, "train")
+    stack.train(fdir, [paths["s2"], paths["s3"]], gt, Path(args.artifact_dir), tune_decoder)
+    if args.baseline:
+        per = pd.read_parquet(Path(args.artifact_dir) / "oof_entity_f05_stack.parquet")
+        compare_to_baseline(per, Path(args.baseline))
+
+
+def cmd_stack_predict(args):
+    import stack
+    fdir = frame_dir(args, "test")
+    paths = cache_paths(args, "test")
+    with Timer("stack predict"):
+        scored, spec = stack.predict(fdir, [paths["s2"], paths["s3"]], Path(args.artifact_dir))
+    data = SplitData(args.data_dir, "test", args.cache_dir)
+    matches = select_with(scored, spec["threshold"], spec["exclusive"], spec["decoder"])
+    problems = check_pairs(matches, scored, data.s1_ids, data.target_ids())
+    if problems:
+        raise SystemExit("submission check failed:\n  " + "\n  ".join(problems[:20]))
+    out = Path(args.output_dir)
+    write_pairs(out / "matching_results.tsv", MATCH_HEADER, data.s1_ids, matches)
+    write_pairs(out / "candidate_pairs.tsv", CAND_HEADER, data.s1_ids, scored)
+    n_matched = matches.groupby("s1_id").size().reindex(data.s1_ids).fillna(0).to_numpy()
+    summary = pd.DataFrame({"country": data.s1_country, "n": n_matched}).groupby("country")["n"].agg(
+        entities="size", with_match=lambda v: (v > 0).mean(), avg_matches="mean")
+    print(summary.to_string())
+    print(f"stack level {spec['level']} ({spec['decoder']} @ {spec['threshold']}): candidates {len(scored):,}, "
+          f"matches {len(matches):,}; wrote {out}")
 
 
 def compare_to_baseline(per: pd.DataFrame, baseline: Path):
@@ -521,25 +727,35 @@ def start_memory_guard(min_free_gb: float):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["eda", "train", "validate", "predict", "all"])
+    ap.add_argument("command", choices=["eda", "train", "validate", "predict", "all",
+                                        "ce-train", "ce-score", "stack", "stack-predict"])
     ap.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     ap.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     ap.add_argument("--artifact-dir", type=Path, default=DEFAULT_ARTIFACT_DIR)
     ap.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     ap.add_argument("--sample", type=int, default=None, help="number of train S1 entities to use")
+    ap.add_argument("--ce-sample", type=int, default=None,
+                    help="train S1 entities (disjoint sample C) whose candidates train the cross-encoder")
     ap.add_argument("--dump-errors", action="store_true", help="write OOF FP/FN pairs for analysis")
     ap.add_argument("--baseline", type=Path, default=None,
                     help="artifact dir (or oof_entity_f05.parquet) of an earlier run: paired bootstrap vs it")
     ap.add_argument("--reuse-stage1", action="store_true", help="reuse artifacts/stage1.txt instead of refitting")
+    ap.add_argument("--ce-full", action="store_true",
+                    help="cross-encoder: train on all of sample C and score every pair (GPU budget)")
+    ap.add_argument("--ce-band", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                    help="cross-encoder: score only pairs whose level-0 probability is in [LO, HI]")
     ap.add_argument("--subset", type=float, default=None,
                     help="dev mode: train on a seeded fraction of regions (e.g. 0.15)")
+    ap.add_argument("--hide-s1", default="0",
+                    help="train: hide this fraction of train S1 ('auto' = match test's targets per S1)")
     ap.add_argument("--min-free-gb", type=float, default=1.5,
                     help="abort if available RAM falls below this (0 disables)")
     args = ap.parse_args(argv)
     if args.min_free_gb > 0:
         start_memory_guard(args.min_free_gb)
     cmds = {"eda": [cmd_eda], "train": [cmd_train], "validate": [cmd_validate],
-            "predict": [cmd_predict], "all": [cmd_train, cmd_predict]}
+            "predict": [cmd_predict], "all": [cmd_train, cmd_predict], "ce-train": [cmd_ce_train],
+            "ce-score": [cmd_ce_score], "stack": [cmd_stack], "stack-predict": [cmd_stack_predict]}
     for fn in cmds[args.command]:
         fn(args)
 

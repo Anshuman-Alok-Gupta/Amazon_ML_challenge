@@ -1,10 +1,18 @@
 .venv/
 __pycache__/
 .pytest_cache/
+.claude/
 student_resource/
-output/
 code/business_entity_resolution/artifacts/
-*_submission.zip
 code/business_entity_resolution/cache/
-upload.tgz
+# submission outputs are too large for GitHub (> 100 MB); they go into the zip
+output/*
+!output/.gitkeep
+output_*/
+# local tooling and scratch files, not part of the submission layout
+aws/
+pdfs/
+HANDOFF*.md
+*.tgz
+*_submission.zip
 *.pdf
