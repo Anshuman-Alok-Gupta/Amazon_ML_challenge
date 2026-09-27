@@ -18,9 +18,10 @@ an assignment step tuned for the precision-heavy metric.
 - **Stage-1 re-ranker.** A LightGBM model re-scores that pool from the retrieval scores and
   cheap name and house-number evidence, and keeps the best 8 candidates per (S1, source).
 - **Matcher.** A two-level stack:
-  - Level 1: LightGBM and XGBoost on 72 similarity and competition features, plus the score of
-    a fine-tuned multilingual transformer cross-encoder (`intfloat/multilingual-e5-small`, MIT,
-    118M parameters) that reads the raw text of both records. It is trained on a GPU and scores
+  - Level 1: LightGBM and XGBoost on 72 similarity and competition features, plus the scores
+    of two fine-tuned multilingual transformer cross-encoders that read the raw text of both
+    records: `intfloat/multilingual-e5-small` (MIT, 118M parameters) and
+    `intfloat/multilingual-e5-base` (MIT, 278M parameters). Both are trained on a GPU and score
     every candidate pair.
   - Level 2: a LightGBM meta-model that also looks at each S1's other candidates.
 - **Assignment.** Each Source 2/3 record is given to at most one Source 1 entity, and a decoder
@@ -36,12 +37,13 @@ the row counts, so the model trains against the same density of distractors (Sec
 |---|---|---|
 | Stack with CPU cross-encoder, standard training data | 0.9840 (US 0.9864, India 0.9804) | 0.975 |
 | Same stack at test distractor density | 0.9838 (US 0.9862, India 0.9804) | 0.977 |
-| **Cross-encoder retrained on GPU, every pair scored (final)** | **0.9852 (US 0.9872, India 0.9821)** | **0.979** |
+| Cross-encoder retrained on GPU, every pair scored | 0.9852 (US 0.9872, India 0.9821) | 0.979 |
+| **+ second cross-encoder (e5-base) as a feature (final)** | **0.9858 (US 0.9878, India 0.9827)** | **0.979** |
 
 The first OOF score is measured on a different training frame. The density-matched frame is
 harder, so its OOF is slightly lower even though the model scores higher on the leaderboard.
 Candidate-pair recall is 98.26%. Everything runs on CPU (EC2 m7i.2xlarge: 8 vCPU, 30 GB RAM)
-except the cross-encoder, which was trained and scored on a single GPU (Colab A100).
+except the cross-encoders, which were trained and scored on a single GPU (Colab A100).
 
 ---
 
@@ -210,6 +212,11 @@ transformer cross-encoder) + constrained assignment
   - On held-out pairs: **AUC 0.9986**, log-loss 0.046, accuracy 98.3%.
 - **Scoring:** every candidate pair, 3.09M training and 15.8M test pairs, at about 8,300 pairs
   per second on the A100.
+- **Second cross-encoder:** `intfloat/multilingual-e5-base` (MIT, 278M parameters), trained and
+  applied exactly the same way (held-out AUC 0.9988, log-loss 0.043, accuracy 98.4%; about 4,100
+  pairs per second). Its score is a separate stack feature, `ce_base_logit`. The two models make
+  partly different mistakes: together they add +0.0071 OOF over the tree model, against +0.0064
+  for e5-small alone.
 - **Earlier CPU version:** before we had a GPU, the cross-encoder was trained on 300k pairs
   (AUC 0.9972) and scored only pairs with level-0 probability between 0.02 and 0.98 (14% of
   test pairs); the rest were left missing. That band skipped exactly the confident
@@ -252,7 +259,7 @@ with the higher macro F0.5 is used:
 
 Each decoder has exactly one tuned number, found by grid search on macro F0.5 (singletons
 included). We take the middle of the best plateau, which is more robust than the single best
-point. The final model uses expected-F0.5 decoding with a floor of 0.35.
+point. The final model uses expected-F0.5 decoding with a floor of 0.55.
 
 **Guarding against overfitting:**
 - Every change and every stacking level is accepted only by a paired bootstrap of per-entity
@@ -270,22 +277,23 @@ point. The final model uses expected-F0.5 decoding with a floor of 0.35.
 - **F_0.5 Score (macro), out of fold:** 4-fold GroupKFold over a 400k-S1 training sample, with
   exclusive assignment. What each component added:
 
-  | Model | Standard data, CPU cross-encoder | Gain (95% CI) | Test density, CPU cross-encoder | Test density, GPU cross-encoder (final) | Gain (95% CI) |
-  |---|---|---|---|---|---|
-  | LightGBM with cosine-only re-ranker (earlier round) | 0.9779 | – | – | – | – |
-  | + learned stage-1 re-ranker | 0.9792 | +0.0012 [+0.0011, +0.0014] | 0.9782 | 0.9782 | – |
-  | + cross-encoder score (level-1 LightGBM) | 0.9832 | +0.0040 [+0.0038, +0.0042] | 0.9829 | 0.9846 | +0.0064 [+0.0062, +0.0066] |
-  | + XGBoost (level-1 mean) | 0.9833 | +0.0001 [+0.0000, +0.0001] | 0.9830 | 0.9847 | +0.0001 [+0.0000, +0.0001] |
-  | + level-2 relational meta-model | 0.9840 | +0.0008 [+0.0007, +0.0009] | 0.9838 | **0.9852** | +0.0005 [+0.0004, +0.0006] |
+  | Model | Standard data, CPU cross-encoder | Gain (95% CI) | Test density, CPU cross-encoder | Test density, GPU e5-small | Test density, GPU e5-small + e5-base (final) | Gain (95% CI) |
+  |---|---|---|---|---|---|---|
+  | LightGBM with cosine-only re-ranker (earlier round) | 0.9779 | – | – | – | – | – |
+  | + learned stage-1 re-ranker | 0.9792 | +0.0012 [+0.0011, +0.0014] | 0.9782 | 0.9782 | 0.9782 | – |
+  | + cross-encoder score(s) (level-1 LightGBM) | 0.9832 | +0.0040 [+0.0038, +0.0042] | 0.9829 | 0.9846 | 0.9853 | +0.0071 [+0.0069, +0.0073] |
+  | + XGBoost (level-1 mean) | 0.9833 | +0.0001 [+0.0000, +0.0001] | 0.9830 | 0.9847 | 0.9853 | +0.0000 [+0.0000, +0.0001] |
+  | + level-2 relational meta-model | 0.9840 | +0.0008 [+0.0007, +0.0009] | 0.9838 | 0.9852 | **0.9858** | +0.0005 [+0.0004, +0.0006] |
 
-  The final model against the CPU cross-encoder version on the same frame: +0.0013, 95% CI
-  [+0.0012, +0.0014]; India +0.0017, US +0.0011. By country:
+  Paired bootstraps on the same frame: the GPU e5-small version beats the CPU cross-encoder
+  version by +0.0013 (95% CI [+0.0012, +0.0014]), and adding e5-base adds another +0.0006
+  ([+0.0005, +0.0007]; India +0.0007, US +0.0006). The final model by country:
 
   | Scope | S1 entities | OOF macro F0.5 |
   |---|---|---|
-  | **Overall** | 400,000 | **0.9852** |
-  | US | 239,845 | 0.9872 |
-  | India | 160,155 | 0.9821 |
+  | **Overall** | 400,000 | **0.9858** |
+  | US | 239,845 | 0.9878 |
+  | India | 160,155 | 0.9827 |
 
   Without the cross-encoder, the stack scores 0.9815 on the standard data (US 0.9847, India
   0.9768).
@@ -299,7 +307,8 @@ point. The final model uses expected-F0.5 decoding with a floor of 0.35.
   | Stack with cross-encoder | 0.9840 | 0.975 |
   | Same stack, trained at test density | 0.9836 | 0.976 |
   | Same, cross-encoder band widened to 0.02–0.98 | 0.9838 | 0.977 |
-  | **Cross-encoder retrained on GPU, every pair scored (final)** | **0.9852** | **0.979** |
+  | Cross-encoder retrained on GPU, every pair scored | 0.9852 | 0.979 |
+  | **+ second cross-encoder (e5-base) as a feature (final)** | **0.9858** | **0.979** |
 
   - While both scores rose, the gap between OOF and the leaderboard stayed roughly constant at
     1.4–1.6 points, until the cross-encoder narrowed it to 0.9. A constant gap points to a
@@ -311,7 +320,9 @@ point. The final model uses expected-F0.5 decoding with a floor of 0.35.
   - The cross-encoder, which compares the raw text of both records, copes best with the extra
     near-duplicates. Every cross-encoder improvement gained more on the leaderboard than out of
     fold: +0.008 vs +0.0025 when it was added, and +0.002 vs +0.0013 when it was retrained on a
-    GPU and applied to every pair.
+    GPU and applied to every pair. The second cross-encoder's +0.0006 OOF did not show at the
+    public leaderboard's three decimals (0.979 for both). We submit it because its gain is
+    significant out of fold and the final ranking uses a different part of the test set.
   - Training at test density then gained on the leaderboard even though its OOF, now measured
     on a harder frame, went down slightly.
 - **Unseen country (France):** there are no labels, but France's match rate and number of
@@ -319,13 +330,13 @@ point. The final model uses expected-F0.5 decoding with a floor of 0.35.
 
   | Test country | S1 entities | S1 with ≥ 1 match | Avg matches per S1 |
   |---|---|---|---|
-  | France | 259,452 | 94.5% | 3.28 |
+  | France | 259,452 | 94.3% | 3.27 |
   | India | 809,986 | 94.0% | 3.30 |
   | US | 663,106 | 94.2% | 3.37 |
 
-  Overall, 1,631,326 of the 1,732,544 test S1 entities (94.2%) have at least one match, with
-  5,756,387 matched pairs in total. With the GPU cross-encoder, France's matches per S1 fell the
-  most (3.36 → 3.28), consistent with more French near-duplicates being rejected. In the training data, 94.4% of S1 entities have at least
+  Overall, 1,630,426 of the 1,732,544 test S1 entities (94.1%) have at least one match, with
+  5,753,236 matched pairs in total. With the GPU cross-encoders, France's matches per S1 fell the
+  most (3.36 → 3.27), consistent with more French near-duplicates being rejected. In the training data, 94.4% of S1 entities have at least
   one true link.
 - **Error analysis** (level-0 model, OOF errors for 20,000 S1 entities). About 93% of wrong
   pairs are missed matches, which is the intended trade-off under F0.5.
@@ -352,8 +363,9 @@ A learned blocking stage and a stacked matcher reach an out-of-fold macro F0.5 o
 public leaderboard score of 0.975. Training at the test set's distractor density raised the
 leaderboard score to 0.976, scoring more pairs with the cross-encoder raised it to 0.977, and
 retraining the cross-encoder on a GPU on all of sample C and scoring every pair raised it to
-0.979 (OOF 0.9852). The only external artefact is a small MIT-licensed pretrained encoder;
-everything except the cross-encoder runs on CPU.
+0.979 (OOF 0.9852). A second cross-encoder raised OOF to 0.9858 (leaderboard 0.979). The only
+external artefacts are two MIT-licensed pretrained encoders; everything except the
+cross-encoders runs on CPU.
 
 The largest single gain came from the transformer cross-encoder (+0.004 OOF, +0.008 on the
 leaderboard). Other gains came from the stage-1 re-ranker's cheap name and house-number
@@ -367,8 +379,9 @@ The remaining losses, in order of size:
 2. Records with a missing address that are scored below the cut-off.
 3. Native-script and trade-name pairs lost in blocking; the candidate set limits F0.5 to
    0.9944.
-4. Cross-encoder capacity: with more GPU time, a larger multilingual encoder, more epochs, or
-   several cross-encoders as separate features could be tried.
+4. Cross-encoder capacity: the second, larger model added +0.0006 OOF, so the e5 family is
+   flattening out. A much stronger pair model (for example an instruction-tuned LLM of up to 8B
+   parameters re-scoring the uncertain pairs) is the most promising next step.
 
 ---
 
@@ -385,8 +398,9 @@ The remaining losses, in order of size:
 - `README.md` gives the exact commands for the final submission, and `requirements.txt` the
   pinned versions.
 - Learned models: LightGBM (MIT), XGBoost (Apache-2.0), and the fine-tuned
-  `intfloat/multilingual-e5-small` (MIT, 118M parameters; pretrained weights from the Hugging Face
-  hub). No external data, APIs or lookups are used.
+  `intfloat/multilingual-e5-small` (MIT, 118M parameters) and `intfloat/multilingual-e5-base`
+  (MIT, 278M parameters); pretrained weights from the Hugging Face hub. No external data, APIs or
+  lookups are used.
 
 ### B. Additional Results
 Timings of the full run on AWS EC2 `m7i.2xlarge` (8 vCPU, 30 GB RAM, no GPU). Some steps ran
@@ -402,7 +416,8 @@ scoring and the stack on the same machine; the cross-encoder was not retrained.
 | Test blocking + features | 15.81M candidate pairs (sharing the CPU with cross-encoder training) | 3,082 s |
 | Cross-encoder training | 300k pairs, 1 epoch, 4 threads | 140 min |
 | Cross-encoder scoring (CPU version) | 362k train + 2.17M test pairs (two passes) | about 140 min |
-| Cross-encoder, final (Colab A100) | train on 1.14M pairs; score 3.09M train + 15.8M test pairs | 25 + 40 min |
+| Cross-encoder e5-small, final (Colab A100) | train on 1.14M pairs; score 3.09M train + 15.8M test pairs | 25 + 40 min |
+| Cross-encoder e5-base, final (Colab A100, in parallel) | same data | about 20 + 80 min |
 | Stack (levels 1–3, ablation) | 3.06M pairs | 34 min |
 | Stack prediction | 15.81M test pairs | about 12 min |
 
@@ -412,7 +427,7 @@ Top level-0 features by gain: `stage1`, `addr_tset`, `t_gap_best`, `comb_cos`, `
 
 The official validator (`utils/validate_submission.py`, run with `--check-ids`) reports
 **PASS** on the final submission. All 1,732,544 S1 entities appear in both files:
-`matching_results.tsv` has 1,631,326 non-empty rows, and `candidate_pairs.tsv` has 1,732,503.
+`matching_results.tsv` has 1,630,426 non-empty rows, and `candidate_pairs.tsv` has 1,732,503.
 
 ### C. Rejected Experiment: Graph Neural Network
 The candidate pairs form a bipartite graph between S1 entities and S2/S3 records. A graph

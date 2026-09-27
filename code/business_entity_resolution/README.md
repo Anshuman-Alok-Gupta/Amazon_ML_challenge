@@ -47,6 +47,8 @@ python src/pipeline.py predict                               # test blocking + f
 # 3. cross-encoder on a GPU (we used a Colab A100): all of sample C, every train / test pair scored
 python src/pipeline.py ce-train --ce-full                    # downloads e5-small once -> artifacts/ce_model
 python src/pipeline.py ce-score --ce-full                    # -> cache/frames/{train,test}/ce.parquet
+python src/pipeline.py ce-train --ce-full --ce-model intfloat/multilingual-e5-base --ce-name base
+python src/pipeline.py ce-score --ce-full --ce-model intfloat/multilingual-e5-base --ce-name base  # + ce_base_logit
 # 4. stacked matcher
 python src/pipeline.py stack                                 # level 1 + level 2, ablation -> artifacts/stack.json
 python src/pipeline.py stack-predict                         # -> ../../output/matching_results.tsv, candidate_pairs.tsv
@@ -55,13 +57,13 @@ python src/pipeline.py stack-predict                         # -> ../../output/m
   training has the test set's density of unmatched records. The hidden entities come from
   outside samples A, B and C, which is why the stage-1 model from step 1 can be reused. The run
   prints `hide-s1 auto: ... h=`.
-- Step 3 needs a CUDA GPU (about 20 min to train and 40 min to score on an A100; float16 is used
+- Step 3 needs a CUDA GPU (on an A100, e5-small takes about 25 min to train and 40 min to score,
+  e5-base roughly twice as long; float16 is used
   automatically on older GPUs such as the T4). On CPU only, drop `--ce-full`: the cross-encoder
   then trains on 300k pairs and scores only pairs with level-0 probability in [0.02, 0.98]
   (the 0.977 leaderboard submission; about 5 h on 8 vCPU).
-- A second cross-encoder becomes a second stack feature with `--ce-name`, e.g.
-  `ce-train --ce-full --ce-model intfloat/multilingual-e5-base --ce-name base` and the same flags
-  for `ce-score` (column `ce_base_logit`).
+- The second cross-encoder (`--ce-name base`) is stored as its own column (`ce_base_logit`)
+  and model dir (`artifacts/ce_model_base`); every column of `ce.parquet` is a stack feature.
 - `train` and `predict` cache their model inputs under `cache/frames/`, so the later
   commands never regenerate candidates.
 - A guard aborts a command when free RAM falls below `--min-free-gb` (default 1.5); pass
@@ -80,8 +82,8 @@ only the new pairs), `--reuse-stage1` (reuse `artifacts/stage1.txt`), `--use-cat
 to level 1 in `stack`), `--baseline DIR` (paired bootstrap of per-entity OOF F0.5 against an
 earlier run), `--dump-errors` (OOF false positives / negatives to `artifacts/`).
 
-Results of the final run (EC2 m7i.2xlarge for everything but step 3): OOF macro F0.5 0.9852
-(US 0.9872, India 0.9821) at test density, 0.979 on the public leaderboard.
+Results of the final run (EC2 m7i.2xlarge for everything but step 3): OOF macro F0.5 0.9858
+(US 0.9878, India 0.9827) at test density, 0.979 on the public leaderboard.
 
 Then run the official checker from `student_resource/`:
 ```bash
