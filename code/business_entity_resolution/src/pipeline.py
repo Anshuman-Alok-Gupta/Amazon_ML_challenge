@@ -22,6 +22,7 @@ from pathlib import Path
 os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
 
 import lightgbm as lgb
+import pyarrow.parquet as pq
 import numpy as np
 import pandas as pd
 
@@ -124,6 +125,13 @@ class SplitData:
         self.s1_ids = s1["entity_id"].to_numpy()
         self.s1_country = s1["country"].to_numpy()
         self.countries = sorted(s1["country_norm"].unique())
+        self.hidden: set = set()
+
+    def hide(self, ids):
+        """Drop these S1 entities from every later step (their targets become orphans)."""
+        self.hidden = set(ids)
+        keep = ~pd.Index(self.s1_ids).isin(self.hidden)
+        self.s1_ids, self.s1_country = self.s1_ids[keep], self.s1_country[keep]
 
     def _resolve(self, df: pd.DataFrame, country: str | None = None) -> pd.Series:
         """Region column with multi-candidate values resolved (per row country, or `country`)."""
@@ -161,6 +169,8 @@ class SplitData:
     def load(self, country: str, cols=FEATURE_COLS):
         f = [("country_norm", "==", country)]
         s1 = pd.read_parquet(self.paths["s1"], columns=cols, filters=f)
+        if self.hidden:
+            s1 = s1[~s1["entity_id"].isin(self.hidden)].reset_index(drop=True)
         tgt = make_target(pd.read_parquet(self.paths["s2"], columns=cols, filters=f),
                           pd.read_parquet(self.paths["s3"], columns=cols, filters=f))
         if "region" in s1.columns:
@@ -322,6 +332,24 @@ def id_lists(pairs: pd.DataFrame) -> dict[str, list[str]]:
     return pairs.groupby("s1_id", sort=False)["cand_id"].apply(list).to_dict()
 
 
+def hide_fraction(args) -> float:
+    """--hide-s1: fraction of train S1 to hide so train has test's targets-per-S1 density.
+
+    'auto' measures it from the row counts: h = 1 - (train targets/S1) / (test targets/S1).
+    """
+    v = str(getattr(args, "hide_s1", "0"))
+    if v != "auto":
+        return float(v)
+    SplitData(args.data_dir, "test", args.cache_dir)  # builds the test caches if missing
+    rate = {}
+    for split in ("train", "test"):
+        n = {k: pq.ParquetFile(p).metadata.num_rows for k, p in cache_paths(args, split).items()}
+        rate[split] = (n["s2"] + n["s3"]) / n["s1"]
+    h = float(np.clip(1 - rate["train"] / rate["test"], 0.0, 0.5))
+    print(f"  hide-s1 auto: targets per S1 train {rate['train']:.3f}, test {rate['test']:.3f} -> h={h:.4f}")
+    return h
+
+
 def train_frame(args):
     """Stage 1 on sample A; candidates, features and labels for a disjoint sample B.
 
@@ -336,6 +364,16 @@ def train_frame(args):
     perm = np.random.default_rng(SEED).permutation(data.s1_ids)
     ids_a, ids_b = np.sort(perm[:n_a]), np.sort(perm[n_a:n_a + n_b])
     ids_c = np.sort(perm[n_a + n_b:n_a + n_b + n_c])
+    h = hide_fraction(args)
+    if h > 0:
+        # hidden S1 come from outside A/B/C, so the samples (and the trained CE) are unchanged
+        start = n_a + n_b + n_c
+        hidden = perm[start:start + int(round(h * len(perm)))]
+        n_s1 = len(perm)
+        data.hide(hidden)
+        n_tgt = sum(pq.ParquetFile(v).metadata.num_rows for k, v in data.paths.items() if k != "s1")
+        print(f"  hide-s1: h={h:.4f}, hid {len(hidden):,} of {n_s1:,} train S1 -> "
+              f"{n_tgt / len(data.s1_ids):.2f} targets per S1 (was {n_tgt / n_s1:.2f})", flush=True)
     gt = gt_dict(data.gt, np.concatenate([ids_a, ids_b, ids_c]))
     n_targets = len(data.target_ids())
     countries = pd.Series(data.s1_country, index=data.s1_ids).loc[ids_b]
@@ -708,6 +746,8 @@ def main(argv=None):
                     help="cross-encoder: score only pairs whose level-0 probability is in [LO, HI]")
     ap.add_argument("--subset", type=float, default=None,
                     help="dev mode: train on a seeded fraction of regions (e.g. 0.15)")
+    ap.add_argument("--hide-s1", default="0",
+                    help="train: hide this fraction of train S1 ('auto' = match test's targets per S1)")
     ap.add_argument("--min-free-gb", type=float, default=1.5,
                     help="abort if available RAM falls below this (0 disables)")
     args = ap.parse_args(argv)

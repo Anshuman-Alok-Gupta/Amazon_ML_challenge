@@ -25,7 +25,9 @@ assignment step.
   directly for macro F0.5 cuts the lists.
 
 **Results:** trained on the full training data, it reaches an **out-of-fold macro F0.5 of 0.9840**
-(US 0.9864, India 0.9804), with 98.25% candidate-pair recall. It scores **0.975 on the public
+(US 0.9864, India 0.9804), with 98.25% candidate-pair recall, and 0.975 on the public
+leaderboard. Retrained at the test set's distractor density (18.7% of training S1 entities hidden,
+see Section 5), it scores **0.9836 out of fold on the harder frame and 0.976 on the public
 leaderboard**. Everything runs on CPU: 8 vCPU / 30 GB, EC2 m7i.2xlarge.
 
 ---
@@ -251,7 +253,8 @@ decoding with floor 0.45.
   | First round | 0.9739 | 0.958 |
   | Normalisation round | 0.9779 | 0.964 |
   | Stack without cross-encoder | 0.9815 | 0.967 |
-  | **Stack with cross-encoder (final)** | **0.9840** | **0.975** |
+  | Stack with cross-encoder | 0.9840 | 0.975 |
+  | **Same stack, trained at test distractor density (final)** | **0.9836** | **0.976** |
 
   - The gap between OOF and leaderboard stayed roughly constant (1.4–1.6 points) while both
     rose, until the cross-encoder narrowed it to 0.9. A constant gap points to a systematic
@@ -296,7 +299,7 @@ decoding with floor 0.45.
 
 ## 6. Conclusion
 A learned blocking stage plus a stacked matcher gives an out-of-fold macro F0.5 of 0.9840 and a
-public leaderboard score of 0.975. Everything runs on CPU, and the only external artefact is a
+public leaderboard score of 0.975, raised to 0.976 by training at the test set's distractor density. Everything runs on CPU, and the only external artefact is a
 small MIT-licensed pretrained encoder. The largest single gain came from the transformer
 cross-encoder (+0.004 OOF, +0.008 on the leaderboard). The next largest came from relational
 features that judge each candidate against the S1's other candidates, and from a stage-1
@@ -304,9 +307,13 @@ re-ranker that uses cheap name and house-number evidence.
 
 The remaining losses, in order of size:
 1. Train/test distractor density. Test has about 24% more unmatched S2/S3 records per S1. The
-   next step is to train under the same density, by hiding the corresponding share of training
-   S1 entities (measured from the data, the same for every country). That would also make the
-   OOF score track the leaderboard.
+   final model is trained under the same density: `train --hide-s1 auto` hides a fraction
+   h = 1 − (train targets per S1) / (test targets per S1) = 1 − 4.677 / 5.754 = 0.187 of the
+   training S1 entities (413,344 of 2,206,821) from the whole pipeline, so their S2/S3 records
+   become unmatched distractors, as on test. h is measured from the row counts, the same for
+   every country. The hidden entities are drawn outside samples A, B and C, so the stage-1 model
+   and the cross-encoder are reused unchanged. On this harder frame the stack scores 0.9836 OOF
+   (US 0.9859, India 0.9800) and 0.976 on the leaderboard.
 2. Records with a missing address that are scored below the cut-off.
 3. Native-script and trade-name pairs lost in blocking; the candidate set caps F0.5 at 0.9944.
 4. A cross-encoder limited by CPU: trained on 300k pairs and applied only to uncertain pairs.
@@ -356,4 +363,3 @@ rows and `candidate_pairs.tsv` has 1,732,503 non-empty rows.
 
 ---
 
-**Note:** Teams can modify sections according to their approach while maintaining clarity and technical depth.
