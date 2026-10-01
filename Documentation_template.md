@@ -77,15 +77,15 @@ Exploratory analysis of the training split (2.21M S1, 5.03M S2 and 5.29M S3 reco
   training at test density (Section 4).
 
 ### 2.2 Solution Strategy
-**Approach Type:** blocking + learned re-ranking + stacked matcher (gradient-boosted trees and a
-transformer cross-encoder) + constrained assignment
+**Approach Type:** blocking + learned re-ranking + stacked matcher (gradient-boosted trees and
+two transformer cross-encoders) + constrained assignment
 
 **Core Innovations:**
 - Fast IDF-weighted sparse retrieval with three views, per country and region.
 - "Target-side competition" features, computed against the *full* S1 pool. A model trained on a
   400k-entity sample then sees the same competition for each record as it will on the full
   test set.
-- A cross-encoder that compares the two records token by token, across scripts.
+- Two cross-encoders that compare the two records token by token, across scripts.
 - Relational features that let the meta-model judge an S1's candidates together: the
   near-identical "twin" distractor, and the best match in the other source.
 - Training at the test set's distractor density, with the hidden fraction measured from the
@@ -226,8 +226,8 @@ transformer cross-encoder) + constrained assignment
   raised the leaderboard score from 0.977 to 0.979.
 
 **Stack (`src/stack.py`).** All levels use the same 4 folds, grouped by S1 entity (GroupKFold).
-- **Level 1:** LightGBM (MIT) and XGBoost (Apache-2.0) on the level-0 features plus the
-  cross-encoder score.
+- **Level 1:** LightGBM (MIT) and XGBoost (Apache-2.0) on the level-0 features plus the two
+  cross-encoder scores.
 - **Level 2:** LightGBM on the level-0 features, the level-1 scores, and 21 relational
   features. These describe the level-1 probabilities of the *same S1's other* candidates:
   - rank, gap to the best, and number of likely candidates, within the S1 and within the source;
@@ -249,8 +249,9 @@ transformer cross-encoder) + constrained assignment
 - h is measured from the row counts, the same way for every country:
   h = 1 − (train targets per S1) / (test targets per S1) = 1 − 4.677 / 5.754 = 0.187, which
   hides 413,344 of 2,206,821 training S1 entities.
-- The hidden entities are drawn from outside samples A, B and C. So the stage-1 model and the
-  cross-encoder are reused unchanged, and the ground truth of the matcher's sample is unaffected.
+- The hidden entities are drawn from outside samples A, B and C. So the stage-1 model is reused
+  unchanged, the cross-encoders' training sample C stays disjoint from the matcher's sample, and
+  the ground truth of the matcher's sample is unaffected.
 
 **Threshold selection method:** each target record is first kept only for its
 highest-probability S1. Two decoders are then compared on out-of-fold predictions, and the one
@@ -268,7 +269,7 @@ point. The final model uses expected-F0.5 decoding with a floor of 0.55.
   OOF F0.5 against the previous model. The lower 95% bound of the gain must be above zero, and
   no country's mean gain may be negative.
 - No country-specific thresholds, models or features are used.
-- The stage-1 re-ranker, the cross-encoder and the matcher are trained on three disjoint S1
+- The stage-1 re-ranker, the cross-encoders and the matcher are trained on three disjoint S1
   samples. Vocabulary is mined only from entities outside the scored sample.
 - The public leaderboard is not used for tuning.
 
@@ -317,9 +318,9 @@ point. The final model uses expected-F0.5 decoding with a floor of 0.55.
     probability 0.2–0.9 is 30% on India test against 19% in training, 19% on US test against
     16%, and 32% on France.
   - The cross-encoder, which compares the raw text of both records, copes best with the extra
-    near-duplicates. Every cross-encoder improvement gained more on the leaderboard than out of
-    fold: +0.008 vs +0.0025 when it was added, and +0.002 vs +0.0020 when the cross-encoders
-    were trained on a GPU and applied to every pair.
+    near-duplicates. Its improvements gained at least as much on the leaderboard as out of fold:
+    +0.008 vs +0.0025 when it was added, and +0.002 vs +0.0020 when the cross-encoders were
+    trained on a GPU and applied to every pair.
   - Training at test density then gained on the leaderboard even though its OOF, now measured
     on a harder frame, went down slightly.
 - **Unseen country (France):** there are no labels, but France's match rate and number of
@@ -332,9 +333,9 @@ point. The final model uses expected-F0.5 decoding with a floor of 0.55.
   | US | 663,106 | 94.2% | 3.37 |
 
   Overall, 1,630,426 of the 1,732,544 test S1 entities (94.1%) have at least one match, with
-  5,753,236 matched pairs in total. With the GPU cross-encoders, France's matches per S1 fell the
-  most (3.36 → 3.27), consistent with more French near-duplicates being rejected. In the training data, 94.4% of S1 entities have at least
-  one true link.
+  5,753,236 matched pairs in total. In the training data, 94.4% of S1 entities have at least one
+  true link. With the GPU cross-encoders, France's matches per S1 fell the most (3.36 → 3.27),
+  consistent with more French near-duplicates being rejected.
 - **Error analysis** (level-0 model, OOF errors for 20,000 S1 entities). About 93% of wrong
   pairs are missed matches, which is the intended trade-off under F0.5.
   - **Common false positives (wrong merges)** are near-duplicate distractors: the same or a
@@ -360,9 +361,8 @@ A learned blocking stage and a stacked matcher reach an out-of-fold macro F0.5 o
 public leaderboard score of 0.975. Training at the test set's distractor density raised the
 leaderboard score to 0.976, scoring more pairs with the cross-encoder raised it to 0.977, and
 training two cross-encoders on a GPU on all of sample C and scoring every pair raised it to
-0.979 (OOF 0.9858). The only
-external artefacts are two MIT-licensed pretrained encoders; everything except the
-cross-encoders runs on CPU.
+0.979 (OOF 0.9858). The only external artefacts are two MIT-licensed pretrained encoders;
+everything except the cross-encoders runs on CPU.
 
 The largest single gain came from the transformer cross-encoder (+0.004 OOF, +0.008 on the
 leaderboard). Other gains came from the stage-1 re-ranker's cheap name and house-number
@@ -389,7 +389,7 @@ The remaining losses, in order of size:
 `src/pipeline.py`.
 - `train` and `predict`: blocking, features and the level-0 model. They cache their model
   inputs under `cache/frames/`, so the later commands never regenerate candidates.
-- `ce-train` and `ce-score`: the cross-encoder.
+- `ce-train` and `ce-score` (with `--ce-full`, on a GPU): the two cross-encoders.
 - `stack` and `stack-predict`: the stacked matcher. `stack-predict` writes
   `output/matching_results.tsv` and `output/candidate_pairs.tsv`.
 - `README.md` gives the exact commands for the final submission, and `requirements.txt` the
@@ -401,8 +401,9 @@ The remaining losses, in order of size:
 
 ### B. Additional Results
 Timings of the full run on AWS EC2 `m7i.2xlarge` (8 vCPU, 30 GB RAM, no GPU). Some steps ran
-at the same time. The final, density-matched run repeated `train`, `predict`, cross-encoder
-scoring and the stack on the same machine; the cross-encoder was not retrained.
+at the same time. The final, density-matched run repeated `train`, `predict` and the stack on
+the same machine; its two cross-encoders were trained and scored on a Colab A100 (last
+cross-encoder rows).
 
 | Stage | Detail | Time |
 |---|---|---|
@@ -411,7 +412,7 @@ scoring and the stack on the same machine; the cross-encoder was not retrained.
 | Candidates + features | samples B (400k) and C (150k) | 1,239 s |
 | Level-0 CV + refit | 3.06M pairs, 72 features, 4 folds | 657 s |
 | Test blocking + features | 15.81M candidate pairs (sharing the CPU with cross-encoder training) | 3,082 s |
-| Cross-encoder training | 300k pairs, 1 epoch, 4 threads | 140 min |
+| Cross-encoder training (CPU version) | 300k pairs, 1 epoch, 4 threads | 140 min |
 | Cross-encoder scoring (CPU version) | 362k train + 2.17M test pairs (two passes) | about 140 min |
 | Cross-encoder e5-small, final (Colab A100) | train on 1.14M pairs; score 3.09M train + 15.8M test pairs | 25 + 40 min |
 | Cross-encoder e5-base, final (Colab A100, in parallel) | same data | about 20 + 80 min |
